@@ -1,22 +1,31 @@
-# OrderOps — Architectural Decisions and Open Questions
+# OrderOps — Architectural Decisions
 
-## Resolved Architectural Decisions
+**Version:** 0.2  
+**Status:** All open questions resolved. Ready for implementation.
 
 ---
 
+## Resolved Architectural Decisions
+
 ### ADR-01 — AI Is Advisory Only; Policy Engine Is the Decision Authority
 
-**Status:** Accepted
+**Status:** Accepted  
+**Resolves:** Original design principle, reinforced by Additional Requirement 1 and 3
 
 **Context:**
 The system deals with refunds, cancellations, and financial compensation. Allowing an LLM to directly execute these operations introduces unacceptable risks: hallucinated actions, inconsistent policy application, and auditability gaps.
 
 **Decision:**
-The LLM agent may only read order context and propose recovery actions from a fixed, pre-defined list. The policy engine independently validates every proposed action. Application services execute approved actions. No execution path exists that bypasses the policy engine.
+The LLM agent may only read order context and propose recovery actions from a fixed, pre-defined list. The policy engine independently validates every proposed action after the AI recommendation and before any execution. Application services execute approved actions. No execution path exists that bypasses the policy engine.
+
+The evaluation order is fixed and non-negotiable:
+1. AI recommendation (read-only context, proposes actions)
+2. Policy evaluation (approves or denies each proposed action)
+3. Execution (only if policy approved)
 
 **Consequences:**
 - The system is more complex (three layers instead of one), but far safer.
-- The AI can be swapped or upgraded without changing execution logic.
+- The AI can be swapped or upgraded without changing execution or policy logic.
 - Every decision is auditable because the policy engine produces a structured decision record.
 - The AI cannot invent novel actions; it can only rank and reason about the defined action types.
 
@@ -30,298 +39,369 @@ The LLM agent may only read order context and propose recovery actions from a fi
 Real restaurant, payment, inventory, and delivery APIs introduce external dependencies, rate limits, costs, and unreliable test conditions. For the Kiro University challenge demo, we need full control over failure scenarios.
 
 **Decision:**
-All external integrations are in-process simulators. Simulators conform to an interface contract identical to what a real integration would satisfy. The rest of the system depends only on the interface, not the simulator implementation.
+All external integrations (restaurant, inventory, payment, delivery) are in-process Ruby objects implementing a defined interface contract. The rest of the system depends only on the interface, not the simulator implementation. Replacing a simulator with a real integration in a future version is a matter of swapping the implementation class, not redesigning the system.
 
 **Consequences:**
 - We can demonstrate any failure scenario deterministically.
-- Replacing simulators with real integrations in a future version is a matter of swapping the implementation, not redesigning the system.
-- Simulator latency and failure rates are configurable to make demos realistic.
+- Simulator latency and failure rates are configurable via Rails credentials / environment config.
 
 ---
 
-### ADR-03 — Event-Driven Internal Architecture
+### ADR-03 — Event-Driven Internal Architecture with Abstract Event Interface
 
-**Status:** Accepted
+**Status:** Accepted  
+**Resolves:** OQ-03, Additional Requirement 9
 
 **Context:**
-The order lifecycle involves multiple subsystems (SLA monitor, failure detector, recovery orchestrator, audit trail, dashboard). Direct method calls between them would create tight coupling and make it impossible to add new observers without modifying existing components.
+The order lifecycle involves multiple subsystems. Direct method calls between them create tight coupling. However, introducing an external broker (Kafka, RabbitMQ) adds operational complexity that is not warranted for V1.
 
 **Decision:**
-All subsystems communicate through a typed internal event bus. State-mutating operations still go through the state machine; the event bus is used for notification and reaction, not for direct state mutation.
+All subsystems communicate through a typed internal event bus abstraction. In V1, the concrete implementation dispatches events via Redis-backed ActiveJob. The event bus interface is defined as a Ruby module/interface so a real broker (Kafka, Redis Streams) can be substituted later by swapping the adapter, not the callers.
+
+Domain events carry a per-order sequence number. Consumers implement deduplication using event IDs stored in the database. The database (PostgreSQL) is the source of truth; the event bus is a delivery mechanism, not the record of truth.
+
+**Interface contract:**
+```
+EventBus.publish(event)          # publishes a domain event
+EventBus.subscribe(type, handler) # registers a handler
+```
+
+The adapter behind `EventBus` is injected at startup (`ActiveJobEventBusAdapter` in V1). A `SynchronousEventBusAdapter` is available for tests to avoid background job overhead.
 
 **Consequences:**
-- Any new subsystem (e.g., a future analytics module) can subscribe to events without touching existing code.
-- The audit trail can passively record all events without being called explicitly.
-- Care must be taken to avoid event storms: a subsystem reacting to an event must not emit another event that triggers itself in a loop.
-- Event ordering guarantees must be documented (see Open Questions, OQ-03).
+- Any new subsystem can subscribe to events without touching existing code.
+- The audit trail records all events passively as a subscriber.
+- Event storms are prevented by checking current order state before acting (consumer-side guard).
+- Per-order sequence numbers allow consumers to detect gaps and out-of-order delivery.
 
 ---
 
-### ADR-04 — State Machine is the Authoritative Order State
+### ADR-04 — State Machine Is the Authoritative Order State, with Optimistic Concurrency
 
-**Status:** Accepted
+**Status:** Accepted  
+**Resolves:** OQ-01
 
 **Context:**
-Multiple subsystems react to and potentially attempt to change order state. Without a single authority, race conditions and inconsistent state are likely.
+Multiple subsystems (background jobs, SLA monitor, recovery orchestrator) may attempt to transition the same order's state concurrently. Without a concurrency control mechanism, race conditions produce corrupted state.
 
 **Decision:**
-All state transitions go through the state machine module. The state machine enforces allowed transitions, rejects invalid ones, and emits a state-changed event. No subsystem sets order state directly.
+The `Order` ActiveRecord model carries an integer `lock_version` column. Rails optimistic locking (`lock_version`) is used for all state transitions. A transition attempt that encounters a stale version raises `ActiveRecord::StaleObjectError`, which the caller must handle by reloading and retrying or abandoning.
+
+All state transitions go through the `OrderStateMachine` service. No code sets `order.state` directly outside that service. The service validates the transition, updates the state and version atomically, and publishes a domain event.
 
 **Consequences:**
-- State integrity is guaranteed by a single enforcement point.
-- Concurrent transition attempts must be serialised at the state machine level (see OQ-01).
-- The state machine must be tested exhaustively for all valid and invalid transitions.
+- State integrity is guaranteed without database-level row locks.
+- Background jobs that race on the same order fail cleanly and can retry via ActiveJob retry semantics.
+- The state machine must be tested exhaustively for all valid, invalid, and concurrent transition scenarios.
 
 ---
 
-### ADR-05 — Policy Configuration Externalised from Code
+### ADR-05 — Technology Stack: Ruby on Rails + PostgreSQL + Redis + Hotwire
 
-**Status:** Accepted
+**Status:** Accepted  
+**Resolves:** OQ-02, OQ-06, OQ-07
 
-**Context:**
-Refund thresholds, compensation limits, re-routing limits, and approval triggers are business rules that will change without code deployments. Embedding them in code makes changes expensive and error-prone.
+**Stack:**
+| Layer | Technology |
+|---|---|
+| Application framework | Ruby on Rails |
+| Primary database | PostgreSQL |
+| Background jobs | ActiveJob with Redis/Sidekiq |
+| Dashboard UI | Rails views + Hotwire (Turbo Streams + Stimulus) |
+| Audit trail persistence | PostgreSQL (same database, `audit_records` table) |
+| Policy configuration | YAML files loaded at startup via Rails initializer |
+| Test framework | RSpec + FactoryBot |
+
+**Rationale:**
+- Rails provides a mature, well-understood convention-over-configuration framework that maps naturally to the domain.
+- PostgreSQL provides ACID transactions, `lock_version` for optimistic concurrency, and JSON columns for event payloads — all without additional services.
+- Hotwire (Turbo Streams) provides real-time dashboard updates over WebSockets without a separate SPA build pipeline.
+- Redis/Sidekiq is the standard Rails background job backend and is already required for Action Cable (used by Turbo Streams).
+- No Kafka or external event broker is introduced in V1 (see ADR-03).
+
+**No external message broker in V1.** Events are delivered via ActiveJob enqueued to Redis/Sidekiq. The event bus interface abstracts this so a broker can be added later.
+
+---
+
+### ADR-06 — Policy Configuration Externalised from Code
+
+**Status:** Accepted  
+**Resolves:** Original design principle
 
 **Decision:**
-All policy parameters are defined in a structured configuration file (YAML or JSON) loaded at startup. The policy engine reads from this configuration; it contains no hard-coded business values. Policy files have a version field.
+All policy parameters (refund thresholds, compensation limits, re-routing limits, approval triggers, failure-type-to-action mappings) are defined in `config/orderops_policy.yml`. The policy engine (`PolicyEngine` service) loads this file at startup via a Rails initializer and exposes a pure evaluation interface. The YAML file has a `version` string field; this version is recorded in every audit record produced by a policy evaluation.
+
+Policy changes require a server restart in V1. Live reload is a future enhancement.
 
 **Consequences:**
-- Policies can be reviewed and changed by non-engineers.
-- Policy version is recorded in the audit trail, enabling post-hoc analysis.
-- Policy changes require a system restart in V1 (live reload is a future enhancement).
+- Policies can be reviewed by non-engineers.
+- Policy version is auditable in the database.
+- The policy engine is a pure function over order state + policy config — zero I/O — making it trivially unit-testable.
 
 ---
 
-### ADR-06 — Deterministic Fallback for AI Failure
+### ADR-07 — Failure Injection Is a First-Class Feature, Gated by Environment
 
-**Status:** Accepted
-
-**Context:**
-LLM calls can fail, time out, or return structurally invalid output. The system must not halt or expose an unhandled error to the operator because the AI is unavailable.
+**Status:** Accepted  
+**Resolves:** OQ-08 (deterministic demo), Additional Requirement 8
 
 **Decision:**
-The AI agent interface has a fallback mode. If the AI call fails or exceeds the configurable timeout, the system applies a deterministic rule-based recovery strategy (e.g., attempt re-route, then escalate to human). The fallback reason is recorded in the audit trail.
+The `FailureInjector` is a first-class service with a formal API. It injects failures by publishing domain events through the same event bus used by real failures. Injected failure events carry `injected: true` in their payload, which is stored in the audit trail.
+
+The `FailureInjector` is only accessible in `development` and `demo` Rails environments. It is explicitly excluded from the `production` environment via a Rails environment check. The demo environment is a named Rails environment (`RAILS_ENV=demo`) distinct from test.
+
+**Consequences:**
+- The demo scenario is fully scripted and repeatable.
+- Injected vs. natural failures are distinguishable in the audit trail.
+- No injection surface exists in production.
+
+---
+
+### ADR-08 — Deterministic Fallback for AI Failure
+
+**Status:** Accepted  
+**Resolves:** OQ-04 (single call confirmed), ADR-06 original
+
+**Decision:**
+The AI agent is invoked via a single LLM call per recovery event in V1. Multi-agent chains are not implemented.
+
+The `LlmAgentInterface` wraps the call in a timeout boundary (configurable, default 15 s). If the call fails, times out, or returns output that fails schema validation, the interface activates the deterministic fallback strategy:
+
+1. Look up the failure type in `config/orderops_policy.yml` under `fallback_recovery`
+2. Return the configured fallback action(s) with `confidence: 0.0` and `source: "fallback"`
+3. Record the fallback reason in the audit trail
+
+The fallback must be defined for every failure type. A missing fallback entry is a startup-time configuration error, not a runtime error.
 
 **Consequences:**
 - System availability does not depend on LLM availability.
 - Fallback decisions are clearly labelled in the audit trail.
-- The fallback strategy must be explicitly defined for each failure type (not just "do nothing").
+- The single-call interface can be swapped to a multi-call chain later without changing the policy engine or orchestrator.
 
 ---
 
-### ADR-07 — Failure Injection Is a First-Class Feature
+### ADR-09 — Provider-Independent LLM Interface with Fake Provider for Tests
 
-**Status:** Accepted
-
-**Context:**
-The demo must showcase real failure scenarios. Relying on natural simulator failures produces non-deterministic demo outcomes.
+**Status:** Accepted  
+**Resolves:** OQ-05
 
 **Decision:**
-The failure injection subsystem is a first-class module with a formal API, not a test hack. It injects failures via the same event bus used by real failures. Injected failures are marked with a flag in the audit trail.
+The `LlmProvider` is an injected dependency conforming to a Ruby interface (module with defined method signatures). V1 ships with two concrete providers:
+
+| Provider | Class | Use |
+|---|---|---|
+| OpenAI-compatible | `LlmProviders::OpenAiProvider` | Production and demo (default) |
+| Deterministic fake | `LlmProviders::FakeProvider` | Unit tests and scripted demos |
+
+The `FakeProvider` returns configurable pre-canned responses keyed by failure type, making tests and demos fully deterministic without any LLM calls.
+
+The provider is configured via `config/orderops.yml`:
+```yaml
+llm:
+  provider: openai   # or: fake
+  model: gpt-4o-mini
+  timeout_seconds: 15
+```
+
+A future `BedrockProvider` or `OllamaProvider` can be added by implementing the `LlmProviders::Base` interface without touching the agent, orchestrator, or any other component.
+
+**AI output schema validation:**
+All LLM responses are parsed and validated against a strict JSON schema (Additional Requirement 2) before being passed to the policy engine. A response that fails schema validation is treated identically to a provider failure — the fallback strategy (ADR-08) activates.
+
+---
+
+### ADR-10 — Recovery Actions Use Idempotency Keys Backed by Database Uniqueness
+
+**Status:** Accepted  
+**Resolves:** OQ-08, Additional Requirement 7
+
+**Decision:**
+Every recovery action execution generates an idempotency key composed of `order_id + action_type + attempt_number`. This key is stored in a `recovery_actions` table with a `UNIQUE` constraint on the idempotency key column.
+
+Before executing any state-changing or financial operation, the `ActionExecutor` inserts a `recovery_actions` record with status `pending`. If a duplicate key error occurs, the action has already been attempted; the executor reads the existing record's status and behaves accordingly (returns the existing result, or escalates if the previous attempt is stuck in `pending`).
+
+On completion, the record is updated to `completed` (success) or `failed`. This covers:
+- Duplicate ActiveJob execution (job enqueued twice, retry after crash)
+- Concurrent recovery attempts triggered by multiple events
 
 **Consequences:**
-- The demo scenario is fully scripted and repeatable.
-- The distinction between injected and natural failures is preserved in the audit trail.
-- The failure injection API is not exposed in production (guarded by a feature flag or removed from the production configuration).
+- Financial operations (refunds, vouchers) are safe against duplicate execution.
+- The `recovery_actions` table serves as both an idempotency store and an execution log.
+- The `recovery_actions` table feeds the recovery queue in the dashboard.
 
 ---
 
-## Open Questions
+### ADR-11 — Human Approval Is Default; Auto-Approve Is Environment-Gated
 
-These questions must be resolved before implementation begins in each affected area. Each question is tagged with the requirements it affects.
+**Status:** Accepted  
+**Resolves:** OQ-09
 
----
+**Decision:**
+Human approval is required for all high-risk actions in production-like mode. An auto-approve mode is available for automated tests and the scripted demo environment, configured via:
 
-### OQ-01 — Concurrency Model for Order State
+```yaml
+# config/orderops.yml
+approvals:
+  mode: manual        # manual | auto_approve
+  auto_approve_delay_seconds: 2   # only used in auto_approve mode
+```
 
-**Affects:** REQ-01, REQ-06
+The `auto_approve` mode is only permitted when `RAILS_ENV` is `test` or `demo`. An attempt to configure `auto_approve` in `production` or `staging` raises a startup error.
 
-**Question:**
-How do we serialise concurrent state transition attempts in V1? Options:
-1. Per-order mutex/lock in memory (simplest, works for single-process V1)
-2. Optimistic concurrency with a version field on the order (more robust, required for multi-process)
-3. Actor model (e.g., one actor per order)
+In `manual` mode, the approval flow is:
+1. `ApprovalQueue` record created, order moved to `PENDING_APPROVAL`
+2. Turbo Stream broadcast updates the dashboard approval queue panel in real-time
+3. Operator approves or rejects via a Rails form action
+4. Decision is persisted and the recovery orchestrator background job is resumed
 
-**Implication:**
-For the Kiro challenge demo, the system is likely single-process. A per-order lock is probably sufficient. However, if the architecture uses async tasks (e.g., async Rust, Python asyncio, Node.js), "lock" means an async mutex. If multi-process distribution is in scope, optimistic concurrency is needed.
-
-**Decision needed:** Choose the concurrency model before implementing the state machine.
-
----
-
-### OQ-02 — Technology Stack
-
-**Affects:** All
-
-**Question:**
-What language and framework will OrderOps be implemented in? Relevant considerations:
-- LLM integration: Python (most mature ecosystem), TypeScript (good async model), Rust (strong types, performance — but less LLM tooling)
-- Event bus: in-process vs. external (Redis Streams, Kafka, etc.)
-- Dashboard: TUI (Rich/Textual for Python, Ratatui for Rust), lightweight web (FastAPI + HTMX, Express), or full SPA
-- State persistence: in-memory (V1), SQLite, or Postgres
-
-**Implication:**
-The architecture is compatible with any of these. The choice affects how the AI agent interface is implemented, the event bus implementation, and the dashboard technology. For the Kiro challenge, something that runs with `docker compose up` or even just `python main.py` is preferable.
-
-**Decision needed:** Choose the stack before creating the project scaffold.
+**Consequences:**
+- Production safety is guaranteed by configuration validation at startup.
+- The demo can run with `auto_approve` for a fully scripted, uninterrupted flow, or with `manual` for a live human-in-the-loop demonstration.
 
 ---
 
-### OQ-03 — Event Bus Ordering Guarantees
+### ADR-12 — V1 Order Data Model
 
-**Affects:** REQ-02, REQ-06, REQ-11
+**Status:** Accepted  
+**Resolves:** OQ-10
 
-**Question:**
-Does the internal event bus guarantee per-order ordering of events? If two events are published for the same order simultaneously (e.g., `SLA_BREACHED` and `FAILURE_INJECTED`), in what order do handlers receive them?
+**Order aggregate fields (PostgreSQL `orders` table):**
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `customer_id` | UUID | References customers table |
+| `restaurant_id` | UUID | Nullable; set on assignment |
+| `state` | string | Enum: current state machine state |
+| `lock_version` | integer | Optimistic concurrency (Rails default) |
+| `items` | jsonb | Array of `{name, quantity, unit_price, currency}` |
+| `order_total` | decimal(10,2) | Pre-computed sum |
+| `currency` | string(3) | ISO 4217, e.g. "USD" |
+| `delivery_address` | jsonb | `{street, city, postcode, lat, lng}` |
+| `payment_intent_id` | string | Simulator payment intent reference |
+| `sla_started_at` | timestamp | When current SLA phase began |
+| `sla_phase` | string | Current SLA phase name |
+| `customer_recovery_preferences` | jsonb | `{preferred_action, contact_method}` — nullable |
+| `cuisine_type` | string | Used for routing |
+| `rejected_restaurant_ids` | uuid[] | Restaurants that have rejected this order |
+| `reroute_attempt_count` | integer | Default 0; used by guardrail OQ-01 |
+| `created_at` | timestamp | |
+| `updated_at` | timestamp | |
 
-**Implication:**
-If events for the same order can arrive out of order at the recovery orchestrator, we may attempt to start recovery twice. We need to decide:
-- Option A: Event bus guarantees per-order FIFO ordering
-- Option B: Consumers deduplicate by checking current order state before acting
-- Option C: Both (belt and suspenders)
-
-**Decision needed:** Define the event ordering contract before implementing the orchestrator.
-
----
-
-### OQ-04 — AI Agent: Single Agent or Multi-Agent?
-
-**Affects:** REQ-08
-
-**Question:**
-Should the AI diagnosis and recovery planning be performed by a single LLM call with a structured prompt, or by a chain of agent calls (e.g., one call to diagnose, one to propose actions, one to estimate impact)?
-
-**Implication:**
-- Single call: simpler, fewer failure modes, lower latency
-- Multi-call chain: can produce richer reasoning, each step is auditable separately
-- Multi-agent (parallel): specialised agents per failure type — powerful but over-engineered for V1
-
-**Recommendation:** Single structured call for V1. The interface should be designed so the internal implementation can be swapped to multi-agent later without changing the caller.
-
-**Decision needed:** Confirm single-call approach for V1.
+**Note on `customer_recovery_preferences`:** Stored on the order (not just the customer) so the preference at order time is preserved in the audit trail even if the customer's profile changes later.
 
 ---
 
-### OQ-05 — LLM Provider and Model
+### ADR-13 — Safety and Customer Constraints Evaluated Before Operational Optimisation
 
-**Affects:** REQ-08
+**Status:** Accepted  
+**Resolves:** Additional Requirement 4
 
-**Question:**
-Which LLM provider and model will be used for the AI agent?
+**Decision:**
+The policy engine evaluation pipeline enforces a fixed evaluation order:
 
-Options:
-- Amazon Bedrock (Claude Sonnet / Haiku) — appropriate for AWS-focused challenge
-- OpenAI (GPT-4o / GPT-4o-mini) — widely available
-- Local model (Ollama) — runs offline, reproducible demo, but lower quality
-- Configurable at startup (recommended)
+1. **Hard safety rules** — actions that would cause physical harm or violate consumer protection law are denied regardless of all other factors. (In V1: allergen/dietary constraints from `customer_recovery_preferences` are checked here if present.)
+2. **Customer constraints** — customer's expressed recovery preferences are evaluated. A customer who has opted out of re-routing cannot be re-routed even if operationally optimal.
+3. **Guardrail rules** — the six fixed business guardrails (ADR-01 / REQ-09).
+4. **Policy rules** — configurable refund/compensation policies from `orderops_policy.yml`.
+5. **Operational optimisation** — if multiple actions pass all above checks, the policy engine selects the one with the best operational score (lowest cost, fastest resolution).
 
-**Implication:**
-The AI agent interface must abstract the LLM provider. The concrete provider is injected at startup. This also affects what credentials the demo environment needs.
-
-**Decision needed:** Choose the default provider for the demo. The interface should support swapping.
+An action that fails stage 1 or 2 is DENIED even if it would pass stages 3–5. This evaluation order is enforced structurally in the `PolicyEngine` class, not just by convention.
 
 ---
 
-### OQ-06 — Audit Trail Persistence
+### ADR-14 — Structured Reasoning Required in Every AI Recommendation
 
-**Affects:** REQ-11
+**Status:** Accepted  
+**Resolves:** Additional Requirement 5
 
-**Question:**
-Where is the audit trail stored in V1?
-- Option A: In-memory list (simplest, lost on restart, fine for demo)
-- Option B: SQLite file (persists across restarts, still zero-dependency)
-- Option C: Postgres (production-grade, requires Docker)
+**Decision:**
+The LLM prompt instructs the AI to return a structured JSON response. The required schema for every proposed recovery action includes:
 
-**Implication:**
-For a demo, in-memory or SQLite is sufficient. However, if the dashboard needs to replay events from a previous run, persistence is required.
+```json
+{
+  "action_type": "REROUTE_RESTAURANT",
+  "confidence": 0.85,
+  "reasoning": "The kitchen reported a hard failure with no ETA. Re-routing to a nearby restaurant with available capacity minimises customer wait time.",
+  "evidence": [
+    "failure_type: KITCHEN_FAILURE",
+    "reroute_attempt_count: 0",
+    "available_restaurants: 3"
+  ],
+  "estimated_customer_impact": "MEDIUM"
+}
+```
 
-**Decision needed:** Define the V1 persistence strategy. SQLite is recommended as the baseline — it adds minimal complexity but makes demos restartable.
+The `evidence` array is a list of factual observations from the order context that support the recommendation. It must not contain customer PII.
 
----
+The `LlmAgentInterface` validates this schema using a JSON Schema validator before passing proposals to the policy engine. Proposals that fail validation are discarded; if all proposals are invalid, the fallback strategy (ADR-08) activates.
 
-### OQ-07 — Dashboard Technology
-
-**Affects:** REQ-12
-
-**Question:**
-What is the dashboard implementation approach?
-- Option A: Terminal UI (TUI) — no browser required, works everywhere the CLI runs
-- Option B: Lightweight web (FastAPI + HTMX or similar) — richer UI, browser required
-- Option C: Full SPA (React/Vue) — maximum interactivity, significantly more build complexity
-
-**Implication:**
-For the Kiro challenge demo, the dashboard needs to be impressive but achievable. A lightweight web dashboard served by the same process (Option B) provides a good balance. The approval queue (REQ-10) particularly benefits from a web UI since it involves operator interaction.
-
-**Decision needed:** Confirm dashboard approach before building REQ-12.
-
----
-
-### OQ-08 — Recovery Action Idempotency
-
-**Affects:** REQ-06, REQ-07, REQ-09
-
-**Question:**
-If a recovery action (e.g., partial refund) is executed and the system crashes before recording success, and then restarts, could the action be executed twice?
-
-**Implication:**
-This is the classic "exactly-once execution" problem. For V1 with simulators and in-memory state, the risk is theoretical. However, the architecture should:
-- Record "execution started" before calling the simulator
-- Record "execution completed" after
-- On recovery (from a crash), check for "started but not completed" records and apply a compensating action or flag for human review
-
-**Decision needed:** Define the idempotency strategy. At minimum, document the known gap in V1 and add a guardrail rule to detect duplicate refund attempts (already in REQ-09).
+**Consequences:**
+- AI reasoning is auditable — the `evidence` array is stored in the audit trail.
+- The dashboard can display why the AI made a recommendation, not just what it recommended.
+- Schema validation acts as a guardrail against prompt injection attempts that try to produce malformed output.
 
 ---
 
-### OQ-09 — Human Approval in the Demo: Who Is the Operator?
+### ADR-15 — Every State-Changing Action Is Auditable
 
-**Affects:** REQ-10, REQ-12
+**Status:** Accepted  
+**Resolves:** Additional Requirement 6
 
-**Question:**
-In the demo scenario, who plays the human operator who approves high-risk recovery actions? Options:
-- The demo presenter manually approves from the dashboard
-- An automatic "simulated operator" approves after a configurable delay
-- Both modes are supported (manual by default, auto-approve mode for automated demos)
+**Decision:**
+The `AuditTrail` service is a subscriber to all domain events on the event bus. It writes an `audit_records` row for every event. The `ActionExecutor` additionally writes explicit "execution started" and "execution completed" (or "execution failed") audit records around every state-changing or financial operation.
 
-**Implication:**
-For a live challenge demo, manual approval makes the AI-human collaboration visible and compelling. An auto-approve mode is useful for automated end-to-end tests.
+The `audit_records` PostgreSQL table is append-only by convention and enforced by:
+- No `UPDATE` or `DELETE` is ever issued against this table in application code.
+- A PostgreSQL `RULE` or `TRIGGER` that raises an error on `UPDATE`/`DELETE` is applied as a defence-in-depth measure.
 
-**Decision needed:** Support both modes; manual is default, auto-approve is configurable.
-
----
-
-### OQ-10 — Scope of V1 Order Data Model
-
-**Affects:** REQ-01, REQ-04, REQ-07
-
-**Question:**
-How much detail should the V1 order data model include?
-
-Minimum viable fields:
-- Order ID, customer ID, restaurant ID
-- Item list (name, quantity, price)
-- Order total
-- Cuisine type
-- Timestamps (created, state transitions)
-- Current state, SLA phase
-
-Potential additions:
-- Delivery address (needed for distance-based routing)
-- Payment method and payment intent ID (needed for refund simulation)
-- Customer contact preference (nice-to-have, stretch)
-
-**Decision needed:** Define the minimum data model before starting implementation. Delivery address and payment method are recommended inclusions even in V1, since routing and refund simulation depend on them.
+**Audit record schema (PostgreSQL `audit_records` table):**
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID | |
+| `order_id` | UUID | |
+| `sequence_number` | integer | Per-order sequence, monotonically increasing |
+| `occurred_at` | timestamp | UTC, millisecond precision |
+| `event_type` | string | |
+| `subsystem` | string | Originating subsystem |
+| `actor` | string | system / ai_agent / human:{operator_id} / simulator |
+| `state_before` | string | Nullable |
+| `state_after` | string | Nullable |
+| `payload` | jsonb | Event-specific data (no PII in AI-authored fields) |
+| `policy_version` | string | Nullable; set when a policy evaluation occurred |
+| `llm_model` | string | Nullable; set for AI invocations |
+| `llm_call_id` | string | Nullable; set for AI invocations |
+| `idempotency_key` | string | Nullable; set for executed recovery actions |
+| `injected` | boolean | True if failure was artificially injected |
 
 ---
 
-## Ambiguities in the Problem Statement
+## Resolved Questions Summary
 
-These are ambiguities in the original brief that were resolved by the decisions above, noted here for transparency.
+All 10 original open questions are now resolved:
+
+| OQ | Question | Resolution |
+|---|---|---|
+| OQ-01 | Concurrency model | ADR-04: Optimistic concurrency via Rails `lock_version` |
+| OQ-02 | Technology stack | ADR-05: Rails + PostgreSQL + Redis/Sidekiq + Hotwire |
+| OQ-03 | Event bus ordering | ADR-03: Per-order sequence numbers + consumer-side dedup |
+| OQ-04 | AI agent architecture | ADR-08: Single LLM call per recovery event in V1 |
+| OQ-05 | LLM provider | ADR-09: OpenAI-compatible default; fake provider for tests; abstract interface for future providers |
+| OQ-06 | Audit trail persistence | ADR-05 / ADR-15: PostgreSQL `audit_records` table |
+| OQ-07 | Dashboard technology | ADR-05: Rails views + Hotwire Turbo Streams; no SPA |
+| OQ-08 | Recovery action idempotency | ADR-10: Idempotency keys with PostgreSQL uniqueness constraints |
+| OQ-09 | Human approval mode | ADR-11: Manual default; auto-approve in `test`/`demo` environments only |
+| OQ-10 | V1 order data model | ADR-12: Full field list defined |
+
+---
+
+## Resolved Ambiguities
 
 | # | Ambiguity | Resolution |
 |---|---|---|
-| A1 | "AI-assisted" — does this mean the AI executes or advises? | ADR-01: AI is strictly advisory. |
-| A2 | "Simulated restaurants" — single simulator or per-restaurant? | Each simulated restaurant is a separate object with its own state, capacity, and failure probability. |
-| A3 | "Human approval for high-risk actions" — who is the human in the demo? | OQ-09: presenter by default, auto-approve mode available. |
-| A4 | "Recovery orchestration" — synchronous or async? | Async via event bus; the orchestrator reacts to events and emits its own events. |
-| A5 | "Complete audit trail" — in-memory for demo or persistent? | OQ-06: SQLite recommended. |
-| A6 | "Operational observability" — what does V1 need to show? | REQ-12 defines six panels. TUI or lightweight web. |
+| A1 | "AI-assisted" — does this mean the AI executes or advises? | ADR-01: AI is strictly advisory. Policy engine decides. Application services execute. |
+| A2 | "Simulated restaurants" — single simulator or per-restaurant? | Each simulated restaurant is a separate Ruby object with its own state, capacity, and failure probability. |
+| A3 | "Human approval for high-risk actions" — who is the human in the demo? | ADR-11: Presenter by default (manual mode); auto-approve available in `demo` environment. |
+| A4 | "Recovery orchestration" — synchronous or async? | ADR-03: Async via ActiveJob/Redis event bus; orchestrator reacts to events and enqueues new jobs. |
+| A5 | "Complete audit trail" — in-memory for demo or persistent? | ADR-15: PostgreSQL `audit_records` table, append-only. |
+| A6 | "Operational observability" — what does V1 need to show? | REQ-12: Six panels via Rails + Hotwire Turbo Streams. |
+| A7 | "Customer recovery preferences" — in scope for V1? | ADR-12: Stored on the order model as a nullable jsonb field. Evaluated in stage 2 of policy pipeline (ADR-13). |

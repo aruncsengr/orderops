@@ -1,12 +1,23 @@
 # OrderOps — Requirements and Acceptance Criteria
 
+**Version:** 0.2  
+**Stack:** Ruby on Rails · PostgreSQL · Redis/Sidekiq · Hotwire
+
 ## Overview
 
 OrderOps is an AI-powered Order Reliability and Recovery Platform for food ordering systems. It monitors the order lifecycle, detects risk and failure conditions, determines safe recovery options, and executes or escalates recovery actions — always under the control of a deterministic policy engine.
 
 ### Guiding principle
 
-> AI reasons and recommends. Deterministic policies decide what is allowed. Application services execute approved actions. An LLM must never directly execute refunds, cancellations, or other high-risk operations.
+> AI reasons and recommends. Deterministic policies decide what is allowed. Application services execute approved actions. An LLM must never directly call mutation functions, issue refunds, or change order state.
+
+### Fixed evaluation pipeline
+
+Every recovery action passes through this pipeline in order. No stage may be skipped:
+
+```
+AI recommendation → Policy evaluation → [Human approval if high-risk] → Execution
+```
 
 ---
 
@@ -15,73 +26,109 @@ OrderOps is an AI-powered Order Reliability and Recovery Platform for food order
 ### REQ-01 — Order Lifecycle and State Management
 
 #### Description
-The system must represent every order as a state machine with a well-defined set of states and allowed transitions. The state machine is the authoritative record of where an order is in its lifecycle.
+The system must represent every order as a state machine with a well-defined set of states and allowed transitions. The state machine is the authoritative record of where an order is in its lifecycle. Concurrent transitions are controlled via optimistic concurrency on a `lock_version` column.
+
+#### Order Data Model
+Every order record in PostgreSQL carries the following fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `customer_id` | UUID | |
+| `restaurant_id` | UUID | Nullable until assigned |
+| `state` | string | Enum value; see state list below |
+| `lock_version` | integer | Rails optimistic locking |
+| `items` | jsonb | Array of `{name, quantity, unit_price, currency}` |
+| `order_total` | decimal(10,2) | |
+| `currency` | string(3) | ISO 4217 |
+| `delivery_address` | jsonb | `{street, city, postcode, lat, lng}` |
+| `payment_intent_id` | string | Simulator payment reference |
+| `sla_started_at` | timestamp | When current SLA phase began |
+| `sla_phase` | string | Current SLA phase name |
+| `customer_recovery_preferences` | jsonb | Nullable: `{preferred_action, contact_method}` |
+| `cuisine_type` | string | Used by router |
+| `rejected_restaurant_ids` | uuid[] | Restaurants that have rejected this order |
+| `reroute_attempt_count` | integer | Default 0 |
+| `created_at` / `updated_at` | timestamp | |
 
 #### States
 | State | Meaning |
 |---|---|
-| `PENDING` | Order created, awaiting restaurant assignment |
-| `ASSIGNED` | Restaurant assigned, awaiting acceptance |
-| `ACCEPTED` | Restaurant accepted, awaiting preparation start |
-| `PREPARING` | Kitchen is preparing the order |
-| `READY_FOR_PICKUP` | Order ready, awaiting courier |
-| `IN_DELIVERY` | Courier has picked up the order |
-| `DELIVERED` | Order successfully delivered |
-| `FAILED` | Terminal failure — order cannot be fulfilled |
-| `CANCELLED` | Order cancelled by system, customer, or policy |
-| `RECOVERED` | Order completed via a recovery path |
-| `PENDING_APPROVAL` | Recovery action proposed; waiting for human approval |
+| `pending` | Order created, awaiting restaurant assignment |
+| `assigned` | Restaurant assigned, awaiting acceptance |
+| `accepted` | Restaurant accepted, awaiting preparation start |
+| `preparing` | Kitchen is preparing the order |
+| `ready_for_pickup` | Order ready, awaiting courier |
+| `in_delivery` | Courier has picked up the order |
+| `delivered` | Order successfully delivered |
+| `failed` | Non-terminal failure — recovery may be attempted |
+| `cancelled` | Order cancelled by system, customer, or policy |
+| `recovered` | Order completed via a recovery path |
+| `pending_approval` | Recovery action proposed; waiting for human approval |
+| `recovering` | Approved recovery action is executing |
 
 #### Allowed Transitions
-- `PENDING` → `ASSIGNED`, `CANCELLED`
-- `ASSIGNED` → `ACCEPTED`, `FAILED`, `PENDING`  (re-route means back to PENDING)
-- `ACCEPTED` → `PREPARING`, `FAILED`
-- `PREPARING` → `READY_FOR_PICKUP`, `FAILED`
-- `READY_FOR_PICKUP` → `IN_DELIVERY`, `FAILED`
-- `IN_DELIVERY` → `DELIVERED`, `FAILED`
-- `FAILED` → `PENDING_APPROVAL`, `RECOVERED`, `CANCELLED`
-- `PENDING_APPROVAL` → `RECOVERING`, `CANCELLED`
-- `RECOVERING` → `RECOVERED`, `FAILED`
+- `pending` → `assigned`, `cancelled`
+- `assigned` → `accepted`, `failed`, `pending` (re-route returns to pending)
+- `accepted` → `preparing`, `failed`
+- `preparing` → `ready_for_pickup`, `failed`
+- `ready_for_pickup` → `in_delivery`, `failed`
+- `in_delivery` → `delivered`, `failed`
+- `failed` → `pending_approval`, `recovering`, `cancelled`
+- `pending_approval` → `recovering`, `cancelled`
+- `recovering` → `recovered`, `failed`
 
 #### Acceptance Criteria
-- AC-01.1: Every order has a unique identifier and a current state persisted in the system.
+- AC-01.1: Every order has a UUID primary key and a persisted current state in PostgreSQL.
 - AC-01.2: An invalid state transition is rejected with a descriptive error; the order state does not change.
-- AC-01.3: Every state transition produces a timestamped event in the audit trail (see REQ-11).
+- AC-01.3: Every state transition produces a timestamped audit record (see REQ-11).
 - AC-01.4: The system can retrieve full order state and metadata by order ID.
-- AC-01.5: Concurrent state transition attempts on the same order are serialised; the second transition sees the result of the first.
+- AC-01.5: Concurrent state transition attempts on the same order raise `ActiveRecord::StaleObjectError` for the losing writer; the winning transition is persisted; the loser can retry.
+- AC-01.6: All order state transitions go through `OrderStateMachine`; no code sets `order.state=` directly outside that class.
 
 ---
 
 ### REQ-02 — Event-Driven Order Monitoring
 
 #### Description
-Order events (state transitions, external simulator events, SLA ticks, failure signals) must be published to an internal event bus. Other subsystems react to events rather than polling order state.
+Order events must be published to an internal event bus. The V1 implementation dispatches events via Redis-backed ActiveJob. The event bus is accessed only through the `EventBus` abstraction, making the backing implementation swappable.
 
 #### Event Types
-- `ORDER_CREATED`, `ORDER_STATE_CHANGED`
-- `RESTAURANT_ACCEPTED`, `RESTAURANT_REJECTED`, `RESTAURANT_UNAVAILABLE`
-- `INVENTORY_FAILURE`
-- `KITCHEN_DELAY`, `KITCHEN_FAILURE`
-- `DELIVERY_DELAY`, `DELIVERY_FAILURE`
-- `PAYMENT_FAILURE`
-- `SLA_WARNING`, `SLA_BREACHED`
-- `FAILURE_INJECTED` (from deterministic failure injection, see REQ-05)
-- `RECOVERY_PROPOSED`, `RECOVERY_APPROVED`, `RECOVERY_REJECTED`, `RECOVERY_EXECUTED`
-- `HUMAN_APPROVAL_REQUESTED`, `HUMAN_APPROVAL_RECEIVED`
+- `order.created`, `order.state_changed`
+- `restaurant.accepted`, `restaurant.rejected`, `restaurant.unavailable`
+- `inventory.failure`
+- `kitchen.delay`, `kitchen.failure`
+- `delivery.delay`, `delivery.failure`
+- `payment.failure`
+- `sla.warning`, `sla.breached`
+- `failure.injected`
+- `recovery.proposed`, `recovery.approved`, `recovery.rejected`, `recovery.executed`
+- `approval.requested`, `approval.received`
+
+#### Event Structure
+Every domain event carries:
+- `event_id` — UUID (used for deduplication)
+- `event_type` — string from the list above
+- `order_id` — UUID
+- `sequence_number` — integer, per-order monotonically increasing
+- `occurred_at` — UTC timestamp
+- `subsystem` — originating component
+- `payload` — type-specific hash
 
 #### Acceptance Criteria
-- AC-02.1: All internal subsystems communicate through the event bus; no subsystem directly calls another's internal methods to change order state.
-- AC-02.2: Events include: event type, order ID, timestamp, originating subsystem, and a payload containing relevant data.
-- AC-02.3: Events are durable within a session — a newly registered handler can replay events since order creation.
-- AC-02.4: The system supports at-least-once delivery of events to registered handlers.
-- AC-02.5: Unhandled exceptions in an event handler do not crash other handlers or the event bus.
+- AC-02.1: All inter-subsystem communication for order status changes goes through `EventBus`; no subsystem calls another's state-mutation methods directly.
+- AC-02.2: Every event includes `event_id`, `event_type`, `order_id`, `sequence_number`, `occurred_at`, `subsystem`, and `payload`.
+- AC-02.3: Consumers deduplicate events by `event_id` before processing; a duplicate event does not trigger a second action.
+- AC-02.4: The system supports at-least-once delivery; consumers are idempotent (see REQ-06, ADR-10).
+- AC-02.5: An exception in one event handler does not prevent other handlers from receiving the same event.
+- AC-02.6: A `SynchronousEventBusAdapter` is available for use in tests, delivering events inline without background jobs.
 
 ---
 
 ### REQ-03 — SLA Monitoring and Breach Detection
 
 #### Description
-Each order phase has a configurable time budget. The SLA monitor watches active orders and emits warnings when a phase is at risk and breach events when the budget is exceeded.
+Each order phase has a configurable time budget. An ActiveJob recurring task (or Sidekiq scheduler) evaluates all active orders at a configurable tick interval and emits warning and breach events.
 
 #### SLA Phases and Default Budgets
 | Phase | Warning threshold | Breach threshold |
@@ -91,84 +138,90 @@ Each order phase has a configurable time budget. The SLA monitor watches active 
 | Order preparation | 600 s | 900 s |
 | Pickup wait | 120 s | 240 s |
 | Delivery | 1800 s | 2700 s |
-| End-to-end (placed → delivered) | 2700 s | 3600 s |
+| End-to-end (created → delivered) | 2700 s | 3600 s |
+
+All thresholds are configurable in `config/orderops.yml`.
 
 #### Acceptance Criteria
-- AC-03.1: The SLA monitor evaluates all active orders at least once per configurable tick interval (default 10 s in simulation).
-- AC-03.2: An `SLA_WARNING` event is emitted when a phase reaches its warning threshold.
-- AC-03.3: An `SLA_BREACHED` event is emitted when a phase exceeds its breach threshold.
-- AC-03.4: SLA events include the affected order ID, the phase name, the time elapsed, and the threshold that was crossed.
-- AC-03.5: SLA thresholds are configurable at system startup without code changes.
-- AC-03.6: Once an order reaches a terminal state (`DELIVERED`, `CANCELLED`, `RECOVERED`, `FAILED`), SLA monitoring for that order stops.
-- AC-03.7: The dashboard (see REQ-12) shows a live count of orders in WARNING and BREACHED state.
+- AC-03.1: The SLA monitor evaluates all non-terminal orders at least once per configurable tick interval (default: 10 s in simulation mode).
+- AC-03.2: An `sla.warning` event is emitted when a phase reaches its warning threshold; it is not re-emitted on every tick while the phase remains in warning.
+- AC-03.3: An `sla.breached` event is emitted when a phase exceeds its breach threshold; it is not re-emitted on every tick while breached.
+- AC-03.4: SLA events include: order ID, phase name, elapsed seconds, threshold crossed.
+- AC-03.5: All SLA thresholds are read from `config/orderops.yml`; no threshold value is hard-coded.
+- AC-03.6: Once an order reaches a terminal state (`delivered`, `cancelled`, `recovered`), SLA monitoring stops for that order.
+- AC-03.7: The dashboard shows a live count of orders in `warning` and `breached` SLA state, updated via Turbo Streams.
 
 ---
 
 ### REQ-04 — Restaurant Routing and Re-Routing
 
 #### Description
-When an order needs a restaurant, or when the current restaurant fails, the routing subsystem selects the best available restaurant from the simulator's restaurant pool.
+The `RestaurantRouter` service selects the best available restaurant from the simulator pool. It does not mutate order state; it returns a routing decision that the orchestrator applies via the state machine.
 
-#### Routing Criteria (in priority order)
+#### Routing Criteria (priority order)
 1. Restaurant is available (not at capacity, not marked unavailable)
 2. Restaurant supports the required cuisine type
-3. Restaurant is within configurable maximum distance
+3. Restaurant is within configurable maximum distance from delivery address
 4. Restaurant has the lowest current queue depth
 
 #### Re-Routing Triggers
-- Restaurant rejects the order
-- Restaurant becomes unavailable after acceptance
-- SLA breach in the `ACCEPTED` or `PREPARING` state with a recoverable restaurant failure
-- Explicit recovery action approved by the policy engine
+- Restaurant rejects the order (`restaurant.rejected` event)
+- Restaurant becomes unavailable after acceptance (`restaurant.unavailable` event)
+- SLA breach in `accepted` or `preparing` state with a recoverable failure
+- Approved `REROUTE_RESTAURANT` recovery action
 
 #### Acceptance Criteria
-- AC-04.1: The router returns the top-ranked available restaurant or a `NO_RESTAURANT_AVAILABLE` result with a reason.
-- AC-04.2: A restaurant that previously rejected the same order is excluded from re-routing candidates.
-- AC-04.3: Re-routing does not mutate order state directly; it produces a routing decision that is applied via the state machine.
-- AC-04.4: If no restaurant is available after re-routing, the order moves to `FAILED` and an escalation event is emitted.
-- AC-04.5: The simulator exposes a method to mark a specific restaurant as unavailable for testing re-routing.
-- AC-04.6: Routing decisions are recorded in the audit trail with the reason for restaurant selection or rejection.
+- AC-04.1: `RestaurantRouter` returns the top-ranked available restaurant or a `RoutingResult::NoRestaurantAvailable` value object with a reason string.
+- AC-04.2: A restaurant whose ID appears in `order.rejected_restaurant_ids` is excluded from candidates.
+- AC-04.3: `RestaurantRouter` returns a `RoutingDecision` value object; it never writes to the `orders` table directly.
+- AC-04.4: If no restaurant is available, the order transitions to `failed` and an escalation event is emitted.
+- AC-04.5: The restaurant simulator exposes a `mark_unavailable(restaurant_id)` method used in failure injection.
+- AC-04.6: Every routing decision (selected or rejected) produces an audit record with the reason.
 
 ---
 
 ### REQ-05 — Failure Detection and Injection
 
 #### Description
-The system must detect real-world failure conditions reported by simulators, and must also support deterministic failure injection for demonstration and testing purposes.
+The `FailureDetector` listens to simulator callbacks and external events, translating them into typed domain failure events. The `FailureInjector` provides a deterministic injection API available in `development` and `demo` environments only.
 
 #### Detectable Failure Types
 | Code | Description |
 |---|---|
 | `RESTAURANT_REJECTION` | Restaurant explicitly rejects the order |
 | `RESTAURANT_UNAVAILABLE` | Restaurant goes offline after acceptance |
-| `INVENTORY_FAILURE` | Item(s) unavailable; kitchen cannot fulfill |
+| `INVENTORY_FAILURE` | Item(s) unavailable |
 | `KITCHEN_DELAY` | Preparation exceeding SLA |
-| `KITCHEN_FAILURE` | Hard kitchen failure, order cannot be prepared |
+| `KITCHEN_FAILURE` | Hard kitchen failure |
 | `DELIVERY_DELAY` | Delivery exceeding SLA |
-| `DELIVERY_FAILURE` | Courier lost, accident, or hard failure |
-| `PAYMENT_FAILURE` | Payment declined or processing error |
+| `DELIVERY_FAILURE` | Courier hard failure |
+| `PAYMENT_FAILURE` | Payment declined or error |
 | `EXTERNAL_SERVICE_FAILURE` | Simulator integration failure |
 
 #### Failure Injection API
-The system must expose a failure injection interface allowing:
-- Inject a specific failure type into a specific order at a specific order state
-- Schedule a failure to occur after a configurable delay
-- Clear all pending injections
+```ruby
+FailureInjector.inject(order_id:, failure_type:, delay_seconds: 0)
+FailureInjector.inject_at_state(order_id:, failure_type:, trigger_state:)
+FailureInjector.clear_pending(order_id:)
+```
+
+Raises `FailureInjector::NotAvailableInEnvironment` in `production` and `staging`.
 
 #### Acceptance Criteria
-- AC-05.1: Each detected failure emits a typed failure event with: failure code, order ID, affected subsystem, and a human-readable description.
-- AC-05.2: The failure injection API can inject any failure type against any active order.
-- AC-05.3: Injected failures produce the same events and trigger the same detection pipeline as naturally occurring failures.
-- AC-05.4: The `FAILURE_INJECTED` event is recorded separately in the audit trail to distinguish injected from natural failures.
-- AC-05.5: The system does not allow failure injection against orders in terminal states.
-- AC-05.6: All failure types listed above are detectable by the failure detection subsystem.
+- AC-05.1: Each detected failure publishes a typed failure event with: failure code, order ID, subsystem, description string.
+- AC-05.2: `FailureInjector` can inject any failure type against any active order in `development`/`demo` environments.
+- AC-05.3: Injected failures pass through the same `FailureDetector` pipeline as natural failures.
+- AC-05.4: Injected failure events carry `injected: true` in their payload; this is stored in the audit record's `injected` column.
+- AC-05.5: `FailureInjector.inject` raises `OrderNotActive` if the order is in a terminal state.
+- AC-05.6: `FailureInjector` raises `NotAvailableInEnvironment` when called in `production` or `staging`.
+- AC-05.7: All nine failure types listed above are handled by `FailureDetector`.
 
 ---
 
 ### REQ-06 — Recovery Orchestration
 
 #### Description
-When a failure or SLA breach is detected, the recovery orchestrator coordinates diagnosis (via AI, REQ-08), policy validation (REQ-09), execution, and escalation.
+The `RecoveryOrchestrator` background job coordinates the full recovery pipeline: AI diagnosis → policy validation → human approval (if required) → idempotent execution → state verification → audit.
 
 #### Recovery Actions
 | Action | Description |
@@ -178,216 +231,259 @@ When a failure or SLA breach is detected, the recovery orchestrator coordinates 
 | `FULL_REFUND` | Cancel and fully refund |
 | `ISSUE_VOUCHER` | Issue a compensation voucher |
 | `ESCALATE_TO_HUMAN` | Request human operator decision |
-| `CANCEL_ORDER` | Cancel without refund (policy-defined conditions) |
+| `CANCEL_ORDER` | Cancel (policy-defined conditions) |
 | `RETRY_DELIVERY` | Attempt delivery re-assignment |
 | `CONTACT_CUSTOMER` | Flag for customer notification |
 
 #### Recovery Flow
-1. Failure or SLA breach event received
-2. AI agent diagnoses (REQ-08) and proposes one or more ranked recovery actions
-3. Policy engine validates each proposed action (REQ-09)
-4. If approved and not high-risk: execute immediately
-5. If approved and high-risk: request human approval (REQ-10)
-6. If rejected by policy: move to next proposed action or escalate
-7. Execute approved action via application service
-8. Verify post-recovery order state
-9. Record everything in audit trail (REQ-11)
+1. Failure or SLA breach event received by `RecoveryOrchestrator`
+2. AI agent diagnoses and proposes ranked recovery actions (REQ-08)
+3. Policy engine validates each proposed action (REQ-09), in the pipeline order defined in ADR-13
+4. If approved and not high-risk: `ActionExecutor` executes immediately
+5. If approved and high-risk: `ApprovalQueue` record created; order → `pending_approval`
+6. If rejected by policy: next candidate is evaluated; if all rejected, `ESCALATE_TO_HUMAN`
+7. `ActionExecutor` uses idempotency key (ADR-10) before calling simulator
+8. Post-execution: order state verified; `recovery.executed` event published
+9. All steps produce audit records (REQ-11)
 
 #### Acceptance Criteria
-- AC-06.1: The orchestrator handles every failure type in REQ-05 and produces at least one candidate recovery action.
-- AC-06.2: Recovery actions are never executed without passing through the policy engine.
-- AC-06.3: If all candidate recovery actions are rejected by policy, the order is escalated to a human operator.
-- AC-06.4: Recovery execution updates the order state machine via defined transitions (not bypassing it).
-- AC-06.5: The orchestrator emits `RECOVERY_PROPOSED`, `RECOVERY_APPROVED`/`RECOVERY_REJECTED`, and `RECOVERY_EXECUTED` events.
-- AC-06.6: A recovery that fails mid-execution leaves the order in `FAILED` state and emits an escalation event; it does not silently discard the error.
-- AC-06.7: The system can handle concurrent recovery attempts on different orders without interference.
+- AC-06.1: `RecoveryOrchestrator` handles all nine failure types and produces at least one candidate recovery action.
+- AC-06.2: `ActionExecutor` is never called without a prior `PolicyEngine` approval result for the same action and order.
+- AC-06.3: If all candidate actions are policy-denied, the order is escalated to human.
+- AC-06.4: Recovery execution transitions order state via `OrderStateMachine`, never directly.
+- AC-06.5: `recovery.proposed`, `recovery.approved`/`recovery.rejected`, and `recovery.executed` events are published.
+- AC-06.6: An execution failure leaves the order in `failed` state and emits an escalation event; the error is not silently swallowed.
+- AC-06.7: Concurrent `RecoveryOrchestrator` jobs for different orders do not interfere; concurrent jobs for the *same* order are prevented by the idempotency key constraint.
 
 ---
 
 ### REQ-07 — Refund and Compensation Policy Management
 
 #### Description
-Refund and compensation rules must be defined as explicit, versioned policy documents — not embedded in AI reasoning or arbitrary code.
+All refund and compensation rules are defined in `config/orderops_policy.yml`. A `PolicyConfiguration` Ruby object is loaded at startup and injected into `PolicyEngine`. The configuration file includes a `version` string.
 
-#### Policy Dimensions
-- Refund eligibility: which failure types qualify, under what order states, within what time window
-- Compensation amounts: percentage or fixed, relative to order total
-- Voucher issuance: when vouchers may substitute or supplement refunds
-- Escalation thresholds: when an action requires human approval (see REQ-10)
-- Cooldown/anti-abuse: how frequently a customer may receive compensation
+#### Policy Dimensions in `orderops_policy.yml`
+- `refund_eligibility`: failure types → eligible order states → time window
+- `compensation`: amounts (percentage or fixed) per failure type
+- `voucher_rules`: when vouchers may substitute or supplement refunds
+- `approval_thresholds`: conditions requiring human approval
+- `cooldown`: minimum interval between compensations per customer
+- `fallback_recovery`: default action per failure type (used by AI fallback, ADR-08)
+- `reroute_limit`: maximum reroute attempts per order (default: 3)
+- `full_refund_approval_threshold`: order total above which `FULL_REFUND` always requires approval (default: 50.00)
 
 #### Acceptance Criteria
-- AC-07.1: All refund and compensation rules are defined in a configuration file or structured data store — not in code logic.
-- AC-07.2: The policy engine can evaluate a proposed refund/compensation action against the active policy and return APPROVED or DENIED with a reason.
-- AC-07.3: Policy evaluation is deterministic — the same inputs always produce the same output.
-- AC-07.4: Policies have a version identifier; the version is recorded in the audit trail when a policy evaluation occurs.
-- AC-07.5: The system ships with a default policy covering all failure types in REQ-05.
-- AC-07.6: A `FULL_REFUND` for an order over a configurable threshold (default: $50) always requires human approval regardless of other policy conditions.
+- AC-07.1: All refund and compensation rules are in `config/orderops_policy.yml`; no thresholds or limits are hard-coded.
+- AC-07.2: `PolicyEngine.evaluate(action, order, context)` returns a `PolicyDecision` with `approved: true/false` and `reason: string`.
+- AC-07.3: Policy evaluation is a pure function — same inputs always produce the same output; no database reads or external I/O.
+- AC-07.4: The policy version from `orderops_policy.yml` is written to the `policy_version` column of every audit record produced during policy evaluation.
+- AC-07.5: The default `orderops_policy.yml` defines rules for all nine failure types in REQ-05.
+- AC-07.6: A `FULL_REFUND` on an order whose `order_total` exceeds `full_refund_approval_threshold` always returns `approved: false, requires_human_approval: true`, regardless of other policy conditions.
 
 ---
 
 ### REQ-08 — AI-Assisted Failure Diagnosis and Recovery Planning
 
 #### Description
-An LLM agent analyses failure context and proposes ranked recovery actions with reasoning. The AI role is strictly advisory — it cannot directly mutate order state or execute financial operations.
+The `LlmAgent` service invokes the configured `LlmProvider` with a structured prompt and validates the response against a JSON schema before passing proposals to `PolicyEngine`. The AI cannot call any function that mutates order state or executes financial operations.
 
-#### AI Agent Inputs
-- Current order state and metadata
-- Full event history for the order
-- Detected failure type and description
-- Available recovery actions (filtered by policy to actions the AI is allowed to propose)
-- Restaurant availability summary
-- SLA status
+#### AI Agent Inputs (read-only context passed to prompt)
+- Current order state and non-PII metadata (order ID, state, items summary, totals, SLA status, reroute count)
+- Full domain event history for the order (event type, subsystem, occurred_at, payload)
+- Failure type and description
+- Available action types (from the defined list in REQ-06)
+- Restaurant availability summary (count, cuisine types available)
 
-#### AI Agent Outputs
-- Ranked list of proposed recovery actions, each with:
-  - Action type (from the defined list in REQ-06)
-  - Confidence score (0.0 – 1.0)
-  - Plain-language reasoning
-  - Estimated customer impact (LOW / MEDIUM / HIGH)
-- Diagnosis summary (plain text, shown in dashboard and audit trail)
+#### Required AI Output Schema
+Each proposed action must conform to:
+```json
+{
+  "action_type": "<string: one of the defined recovery action types>",
+  "confidence": "<float: 0.0 to 1.0>",
+  "reasoning": "<string: plain-language explanation, no PII>",
+  "evidence": ["<string>", "..."],
+  "estimated_customer_impact": "<LOW|MEDIUM|HIGH>"
+}
+```
 
-#### Constraints
-- The AI must not invent action types outside the defined list in REQ-06.
-- The AI must not include customer PII in reasoning text stored in the audit trail.
-- AI calls must be wrapped so that a failure in the LLM (timeout, error, invalid output) falls back to a default rule-based recovery path.
+The response is an array of such objects, ordered by descending confidence.
+
+#### Constraints (enforced structurally, not by convention)
+- `LlmProvider` implementations expose only `complete(prompt) → string`. They have no access to `OrderStateMachine`, `ActionExecutor`, `PolicyEngine`, or any simulator.
+- `LlmAgent` passes only a read-only context struct to the provider — not ActiveRecord objects.
+- The prompt template must not include customer PII fields (`customer_id` is included as an opaque UUID reference only).
 
 #### Acceptance Criteria
-- AC-08.1: For every detected failure, the AI agent is invoked and produces at least one proposed recovery action within a configurable timeout (default: 15 s).
-- AC-08.2: AI output is structured (typed, not free-form) and validated against a schema before being passed to the policy engine.
-- AC-08.3: If the AI fails or times out, the system uses a deterministic fallback recovery strategy and logs the fallback reason.
-- AC-08.4: The AI cannot call any tool or function that mutates order state, issues refunds, or executes financial operations.
-- AC-08.5: Each AI diagnosis and proposal is stored in the audit trail, including the model name, input summary, and output.
-- AC-08.6: The AI proposal includes a confidence score and reasoning string for each suggested action.
+- AC-08.1: For every detected failure, `LlmAgent` produces at least one proposed recovery action within the configured timeout (default: 15 s).
+- AC-08.2: AI output is parsed and validated against the JSON schema before being passed to `PolicyEngine`; invalid output triggers the fallback (AC-08.3).
+- AC-08.3: If the AI call fails, times out, or returns invalid output, `LlmAgent` returns the deterministic fallback actions from `orderops_policy.yml` with `confidence: 0.0` and `source: "fallback"`.
+- AC-08.4: `LlmProvider` has no method signature that accepts or returns ActiveRecord objects, order mutations, or financial operation parameters.
+- AC-08.5: Every AI invocation produces an audit record with: `llm_model`, `llm_call_id`, input context summary (truncated), and the full structured output.
+- AC-08.6: Every proposed action in AI output includes `confidence`, `reasoning`, and `evidence` array.
+- AC-08.7: `LlmProviders::FakeProvider` returns pre-configured responses keyed by failure type, with no network calls, for use in tests and scripted demos.
 
 ---
 
 ### REQ-09 — Deterministic Policy and Guardrail Engine
 
 #### Description
-The policy engine is the sole decision authority for whether a recovery action may execute. It is stateless, deterministic, and operates independently of the AI.
+`PolicyEngine` is the sole decision authority for whether a recovery action may execute. It is a pure Ruby service: no ActiveRecord, no I/O. It evaluates actions in the fixed pipeline order defined in ADR-13.
 
-#### Guardrail Rules (always enforced, cannot be overridden by AI)
-1. A refund may not exceed the original order total.
-2. A `FULL_REFUND` cannot be executed if the order has already been partially delivered.
-3. `REROUTE_RESTAURANT` cannot be attempted more than N times (configurable, default: 3) for the same order.
-4. No action may be executed on an order in a terminal state.
-5. A `CANCEL_ORDER` action requires either a human approval or a policy-defined automatic condition (e.g., payment failure with no items prepared).
-6. An action that would cause a duplicate refund is denied.
+#### Evaluation Pipeline (order is enforced)
+1. **Hard safety rules** (allergen/dietary constraints from `customer_recovery_preferences` if present)
+2. **Customer constraints** (expressed recovery preferences)
+3. **Guardrail rules** (the six rules below)
+4. **Policy rules** (from `orderops_policy.yml`)
+5. **Operational score** (tiebreaker when multiple actions are approved)
+
+#### Guardrail Rules (stage 3 — always enforced)
+1. A refund may not exceed `order.order_total`.
+2. `FULL_REFUND` cannot execute if the order is in `in_delivery` or `delivered` state.
+3. `REROUTE_RESTAURANT` cannot be attempted if `order.reroute_attempt_count >= policy.reroute_limit`.
+4. No action may execute on an order in a terminal state (`delivered`, `cancelled`, `recovered`).
+5. `CANCEL_ORDER` requires human approval unless the policy defines an automatic condition that is met.
+6. An action whose idempotency key already exists in `recovery_actions` with status `completed` is denied as a duplicate.
 
 #### Acceptance Criteria
-- AC-09.1: The policy engine evaluates all six guardrail rules before approving any recovery action.
-- AC-09.2: If any guardrail rule fails, the action is DENIED and the denial reason cites which rule was violated.
-- AC-09.3: The policy engine also applies the configurable refund/compensation policies from REQ-07.
-- AC-09.4: Policy evaluation takes no external I/O — it is a pure function over order state and policy configuration.
-- AC-09.5: The policy engine is unit-testable independently of the rest of the system.
-- AC-09.6: All policy evaluations (approved and denied) are logged in the audit trail.
+- AC-09.1: `PolicyEngine.evaluate` applies all five pipeline stages in order; an action denied at stage N is not evaluated at stage N+1.
+- AC-09.2: A denied action returns `PolicyDecision` with `approved: false` and `reason` citing the specific rule violated.
+- AC-09.3: Stage 3 guardrail rules are applied before stage 4 configurable policy rules.
+- AC-09.4: `PolicyEngine` takes no database connections, HTTP clients, or external I/O as dependencies.
+- AC-09.5: `PolicyEngine` has a dedicated RSpec unit test file with 100% branch coverage of all guardrail rules.
+- AC-09.6: Every evaluation (approved and denied) produces an audit record with the pipeline stage that determined the outcome and the `policy_version`.
 
 ---
 
 ### REQ-10 — Human Approval for High-Risk Actions
 
 #### Description
-Certain recovery actions require a human operator to review and approve before execution. The system must queue these requests, surface them in the UI, and block execution until a decision is received.
+High-risk recovery actions are queued in the `approval_queue` database table and surfaced in the dashboard via Turbo Streams. Execution is blocked until an operator approves or rejects.
 
-#### High-Risk Action Triggers (any of the following)
-- Action type is `FULL_REFUND` and order total exceeds configurable threshold (default: $50)
-- Action type is `CANCEL_ORDER` and order is in `PREPARING` or later state
-- Re-routing attempt count ≥ configurable limit (default: 2)
-- AI confidence score < configurable threshold (default: 0.5) for the top-ranked action
-- Policy configuration explicitly marks an action as requiring approval
+#### High-Risk Action Triggers (any condition triggers approval requirement)
+- `FULL_REFUND` and `order.order_total > policy.full_refund_approval_threshold`
+- `CANCEL_ORDER` and order state is `preparing`, `ready_for_pickup`, `in_delivery`, or later
+- `order.reroute_attempt_count >= policy.reroute_approval_threshold` (default: 2)
+- AI top-ranked action `confidence < policy.min_confidence_threshold` (default: 0.5)
+- Action type is explicitly listed under `approval_required` in `orderops_policy.yml`
 
 #### Approval Workflow
-1. System emits `HUMAN_APPROVAL_REQUESTED` event and places order in `PENDING_APPROVAL` state
-2. Dashboard shows the pending request with full context (order, failure, AI diagnosis, proposed action)
-3. Operator approves or rejects with an optional note
-4. System emits `HUMAN_APPROVAL_RECEIVED` event and proceeds accordingly
-5. SLA monitoring continues during approval wait; a separate approval SLA timer fires if unanswered beyond a configurable timeout (default: 120 s)
+1. `PolicyEngine` returns `approved: true, requires_human_approval: true`
+2. `RecoveryOrchestrator` creates an `ApprovalQueue` record; order → `pending_approval`
+3. `approval.requested` event published → Turbo Stream updates dashboard approval panel
+4. Operator approves or rejects via Rails form (PATCH `/approval_queue/:id`)
+5. `approval.received` event published; `RecoveryOrchestrator` resumes
+6. Approval SLA timer: if no decision within `policy.approval_timeout_seconds` (default: 120), escalation event emitted
+
+#### Auto-approve mode (test/demo only)
+When `config/orderops.yml` sets `approvals.mode: auto_approve`, `ApprovalWorker` automatically approves after `auto_approve_delay_seconds`. Startup raises if `RAILS_ENV` is `production` or `staging`.
 
 #### Acceptance Criteria
-- AC-10.1: Any action classified as high-risk (per the triggers above) is blocked until human approval is received.
-- AC-10.2: The dashboard displays all pending approvals with order ID, failure type, AI diagnosis, proposed action, confidence score, and elapsed wait time.
-- AC-10.3: An operator can approve or reject a pending request from the dashboard.
-- AC-10.4: If the approval timeout expires with no decision, the system escalates (emits an escalation event) and optionally executes a safe fallback action per policy.
-- AC-10.5: Approved and rejected decisions are recorded in the audit trail with the operator identifier and timestamp.
-- AC-10.6: The system does not process multiple simultaneous approvals for the same order.
+- AC-10.1: Any high-risk action (per the five triggers above) creates an `ApprovalQueue` record before any execution occurs.
+- AC-10.2: The dashboard approval panel shows: order ID, failure type, AI diagnosis summary, proposed action, confidence score, elapsed wait time — updated in real-time via Turbo Streams.
+- AC-10.3: PATCH `/approval_queue/:id` with `{decision: approved|rejected, note: string}` processes the decision.
+- AC-10.4: If the approval timeout expires, an escalation event is emitted; a configurable safe fallback action is executed if defined in policy.
+- AC-10.5: Approval decisions are recorded in the audit trail with `actor: "human:{operator_id}"`, timestamp, and note.
+- AC-10.6: Submitting a second approval decision for an already-decided `ApprovalQueue` record returns a 422 response.
+- AC-10.7: `auto_approve` mode raises `ApprovalConfiguration::InvalidEnvironment` at startup in `production`/`staging`.
 
 ---
 
 ### REQ-11 — Complete Audit Trail
 
 #### Description
-Every meaningful event in the system is recorded immutably in a per-order audit log. The audit trail must be comprehensive enough to reconstruct the full history of any order after the fact.
+The `AuditTrail` service is an event bus subscriber. It writes an `audit_records` PostgreSQL row for every domain event and for every explicit execution boundary recorded by `ActionExecutor`. Records are append-only.
 
-#### Audit Record Fields
-- Record ID (unique)
-- Order ID
-- Timestamp (UTC, millisecond precision)
-- Event type
-- Originating subsystem
-- Actor (system component, AI agent, human operator, or simulator)
-- Before state (where applicable)
-- After state (where applicable)
-- Payload (event-specific structured data)
-- Policy version (where a policy evaluation occurred)
-- AI model name and call ID (where an AI call occurred)
-- Injected failure flag (true if the event was artificially injected)
+#### `audit_records` Table Schema
+| Column | Type | Notes |
+|---|---|---|
+| `id` | UUID | |
+| `order_id` | UUID | Indexed |
+| `sequence_number` | integer | Per-order monotonic counter |
+| `occurred_at` | timestamp | UTC, millisecond precision |
+| `event_type` | string | |
+| `subsystem` | string | |
+| `actor` | string | `system` / `ai_agent` / `human:{id}` / `simulator` |
+| `state_before` | string | Nullable |
+| `state_after` | string | Nullable |
+| `payload` | jsonb | No customer PII in AI-authored fields |
+| `policy_version` | string | Nullable |
+| `llm_model` | string | Nullable |
+| `llm_call_id` | string | Nullable |
+| `idempotency_key` | string | Nullable |
+| `injected` | boolean | Default false |
+
+Append-only enforcement: a PostgreSQL trigger raises an exception on any `UPDATE` or `DELETE` against `audit_records`.
 
 #### Acceptance Criteria
-- AC-11.1: Every state transition produces an audit record.
-- AC-11.2: Every policy evaluation (approved or denied) produces an audit record.
-- AC-11.3: Every AI invocation produces an audit record including the input context summary and output.
-- AC-11.4: Every human approval request and decision produces an audit record with the operator identity.
-- AC-11.5: Audit records are append-only within a session; no record may be modified or deleted.
-- AC-11.6: The full audit trail for any order is retrievable by order ID.
-- AC-11.7: The demo dashboard can render a chronological timeline of an order's audit trail.
+- AC-11.1: Every order state transition produces an audit record with `state_before` and `state_after`.
+- AC-11.2: Every policy evaluation (approved or denied) produces an audit record with `policy_version` and the pipeline stage that decided the outcome.
+- AC-11.3: Every AI invocation produces an audit record with `llm_model`, `llm_call_id`, input context summary, and the full structured AI output.
+- AC-11.4: Every human approval request and decision produces an audit record with `actor: "human:{operator_id}"`.
+- AC-11.5: No `UPDATE` or `DELETE` SQL is ever issued against `audit_records` in application code; the PostgreSQL trigger provides a second enforcement layer.
+- AC-11.6: `AuditTrail.for_order(order_id)` returns all records for an order in `sequence_number` ascending order.
+- AC-11.7: The audit timeline dashboard panel renders the complete event history for an order on demand.
 
 ---
 
 ### REQ-12 — Operational Observability
 
 #### Description
-The system must provide a real-time operational dashboard showing system health, active order status, SLA state, and recovery activity. For V1 this is a terminal-based or lightweight web UI.
+The operational dashboard is a Rails application served at `/dashboard`. All real-time updates use Hotwire Turbo Streams over Action Cable (backed by Redis). No separate SPA is built.
 
 #### Dashboard Panels
-1. **Order Stream** — live list of active orders with current state, phase, and SLA colour (green / amber / red)
-2. **Failure Feed** — real-time stream of failure events with type, order, and elapsed time
-3. **Recovery Queue** — pending and in-progress recoveries with AI diagnosis summary
-4. **Approval Queue** — pending human approvals (see REQ-10)
-5. **System Metrics** — counts of orders by state, recovery success rate, average recovery time
-6. **Audit Timeline** — per-order chronological event timeline (on demand)
+1. **Order Stream** (`turbo-frame id="order-stream"`) — live list: order ID, state, SLA phase, SLA colour (green/amber/red)
+2. **Failure Feed** (`turbo-frame id="failure-feed"`) — real-time: failure type, order ID, elapsed since failure
+3. **Recovery Queue** (`turbo-frame id="recovery-queue"`) — active recoveries: AI diagnosis summary, proposed action, status
+4. **Approval Queue** (`turbo-frame id="approval-queue"`) — pending approvals with approve/reject buttons
+5. **System Metrics** (`turbo-frame id="metrics"`) — aggregate counters refreshed on each relevant event
+6. **Audit Timeline** (`/dashboard/orders/:id/audit`) — full chronological audit trail for one order
 
 #### Acceptance Criteria
-- AC-12.1: The dashboard refreshes automatically; operators do not need to manually reload.
-- AC-12.2: Each active order is visible with its current state and SLA colour code.
-- AC-12.3: The failure feed shows failures in real-time as they occur.
-- AC-12.4: The recovery queue shows the AI's diagnosis summary and proposed action for each in-progress recovery.
-- AC-12.5: The approval queue allows an operator to action a pending approval from within the dashboard.
-- AC-12.6: System metrics include: total orders, orders in WARNING state, orders in BREACHED state, recovery success count, recovery failure count.
-- AC-12.7: An audit timeline for any order can be opened from the dashboard by order ID.
+- AC-12.1: All six panels are rendered by Rails ERB views; Turbo Stream broadcasts push updates without a page reload.
+- AC-12.2: Each active order in the Order Stream shows current state and SLA colour (green: within warning threshold; amber: at warning; red: breached).
+- AC-12.3: New failure events appear in the Failure Feed within one Sidekiq processing cycle of the failure event being published.
+- AC-12.4: The Recovery Queue shows the AI diagnosis summary and proposed action for each in-progress recovery.
+- AC-12.5: The Approval Queue renders approve/reject form buttons that submit to `PATCH /approval_queue/:id`.
+- AC-12.6: System Metrics display: total active orders, orders in SLA warning, orders in SLA breached, recovery success count, recovery failure count.
+- AC-12.7: The Audit Timeline at `/dashboard/orders/:id/audit` renders all audit records for the order in chronological sequence.
 
 ---
 
 ## Non-Functional Requirements
 
 ### NFR-01 — Simulation Fidelity
-- All external integrations (restaurant, inventory, payment, delivery) are implemented as in-process simulators.
-- Simulators must support configurable latency, failure rates, and capacity limits.
-- Simulators must support deterministic failure injection (see REQ-05).
+- All external integrations (restaurant, inventory, payment, delivery) are implemented as Ruby service objects conforming to defined interfaces in `app/interfaces/`.
+- Simulators support configurable latency (via `sleep` with jitter), failure probability, and capacity limits — all set in `config/orderops.yml`.
+- Simulators support deterministic failure injection via the `FailureInjector` API (REQ-05).
 
 ### NFR-02 — Testability
-- Each subsystem (state machine, event bus, SLA monitor, router, policy engine, AI agent interface, recovery orchestrator, audit trail) must be independently unit-testable.
-- Integration tests must cover the primary demo scenario end-to-end.
-- The policy engine must have 100% branch coverage in unit tests for all guardrail rules.
+- Each subsystem (`OrderStateMachine`, `EventBus`, `SlaMonitor`, `RestaurantRouter`, `PolicyEngine`, `LlmAgent`, `RecoveryOrchestrator`, `AuditTrail`) has a dedicated RSpec unit spec.
+- Integration specs cover the primary demo scenario end-to-end using `FakeProvider` and `SynchronousEventBusAdapter`.
+- `PolicyEngine` unit specs achieve 100% branch coverage of all six guardrail rules and all five pipeline stages.
+- `FactoryBot` factories exist for all domain models.
 
 ### NFR-03 — Configurability
-- All SLA thresholds, policy limits, high-risk action thresholds, and simulation parameters must be configurable via a single configuration file at startup.
-- No business rule may be hard-coded as a magic number.
+- All SLA thresholds, policy limits, high-risk action thresholds, simulation parameters, LLM provider, and approval mode are read from `config/orderops.yml` and `config/orderops_policy.yml` at startup.
+- No business rule value is hard-coded as a Ruby literal.
+- A missing required configuration key raises a descriptive error at startup, not at runtime.
 
 ### NFR-04 — Extensibility
-- Adding a new failure type should require changes in at most three files: failure type definition, default policy, and failure detector.
-- Adding a new recovery action should require changes in at most three files: action type definition, default policy, and action executor.
+- Adding a new failure type requires changes to: (1) the failure type constant file, (2) `config/orderops_policy.yml`, (3) the `FailureDetector` handler. No other files require modification.
+- Adding a new recovery action type requires changes to: (1) the action type constant file, (2) `config/orderops_policy.yml`, (3) `ActionExecutor`. No other files require modification.
+- Adding a new LLM provider requires creating one new class in `app/services/llm_providers/` implementing `LlmProviders::Base`.
 
-### NFR-05 — Reliability of the AI Boundary
-- The boundary between the AI agent and the rest of the system must be explicit and enforced at the type/interface level.
-- The AI can only call a defined, restricted set of read-only tools; it has no access to state mutation or financial operation functions.
+### NFR-05 — AI Boundary Enforcement
+- `LlmProvider` implementations are restricted to a single public method: `complete(prompt: String) → String`.
+- `LlmAgent` constructs a read-only context struct (`LlmContext`) that excludes ActiveRecord objects and customer PII beyond opaque IDs.
+- Code review checklist item: no `LlmProvider` subclass may `require` or reference `OrderStateMachine`, `ActionExecutor`, `PolicyEngine`, any simulator class, or any ActiveRecord model.
+
+### NFR-06 — Idempotency
+- Every recovery action execution is guarded by an idempotency key in the `recovery_actions` table.
+- A `UNIQUE` constraint on `recovery_actions.idempotency_key` is enforced at the database level.
+- `ActionExecutor` handles `ActiveRecord::RecordNotUnique` (duplicate key) by reading the existing record's status rather than raising an unhandled error.
+
+### NFR-07 — Rails Conventions
+- The application follows standard Rails directory structure: models in `app/models/`, services in `app/services/`, jobs in `app/jobs/`, views in `app/views/`.
+- Domain service objects (not ActiveRecord models) live in `app/services/` and are named as `VerbNoun` (e.g., `RecoveryOrchestrator`, `PolicyEngine`, `LlmAgent`).
+- Background jobs (ActiveJob subclasses) live in `app/jobs/`.
+- Interface definitions (Ruby modules with documented method signatures) live in `app/interfaces/`.
