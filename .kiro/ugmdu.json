@@ -1,7 +1,8 @@
 {
   "campaignId": "kiro-university-2026",
-  "participantId": "",
+  "participantId": "341874a8-9051-7021-ea3a-f7dff250affd",
   "lessons": [],
   "surfaces": [],
-  "notes": {}
+  "notes": {},
+  "repoUrl": "https://github.com/aruncsengr/orderops"
 }
