@@ -3,16 +3,15 @@
 # ActiveJobEventBusAdapter — delivers events via ActiveJob (Solid Queue in V1).
 #
 # Each EventBus.publish call:
-#   1. Immediately calls all synchronous handlers (e.g. AuditTrail)
-#   2. Enqueues DispatchDomainEventJob for asynchronous handlers
-#
-# Handlers registered via #subscribe/:subscribe_all are split into two groups:
-#   - synchronous: called inline (default for all handlers not explicitly marked async)
-#   - async: called via the background job
-#
-# For V1 simplicity all handlers are invoked synchronously first (to guarantee
-# audit trail writes happen in the same transaction as the triggering action),
-# then the job is enqueued for any async subscribers added later.
+#   1. Immediately calls all in-process handlers (e.g. AuditTrail) synchronously
+#      in the calling thread. This means audit records are written before
+#      #publish returns, but they are NOT in the same database transaction as
+#      the triggering state change — they are separate INSERTs. A crash between
+#      the order UPDATE committing and the audit INSERT completing will leave a
+#      gap. This is an accepted trade-off for V1; the append-only trigger and
+#      per-order sequence numbers make such gaps detectable.
+#   2. Enqueues DispatchDomainEventJob (via Solid Queue) for any async
+#      subscribers that need background processing.
 #
 # ADR-03: The interface is identical to SynchronousEventBusAdapter so the two
 # are interchangeable without changing callers.

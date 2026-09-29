@@ -128,7 +128,7 @@ Every domain event carries:
 ### REQ-03 — SLA Monitoring and Breach Detection
 
 #### Description
-Each order phase has a configurable time budget. An ActiveJob recurring task (or Sidekiq scheduler) evaluates all active orders at a configurable tick interval and emits warning and breach events.
+Each order phase has a configurable time budget. A Solid Queue recurring job (`SlaMonitorJob`, configured in `config/recurring.yml`) evaluates all active orders at a configurable tick interval and emits warning and breach events.
 
 #### SLA Phases and Default Budgets
 | Phase | Warning threshold | Breach threshold |
@@ -444,7 +444,7 @@ The operational dashboard is a Rails application served at `/dashboard`. All rea
 #### Acceptance Criteria
 - AC-12.1: All six panels are rendered by Rails ERB views; Turbo Stream broadcasts push updates without a page reload.
 - AC-12.2: Each active order in the Order Stream shows current state and SLA colour (green: within warning threshold; amber: at warning; red: breached).
-- AC-12.3: New failure events appear in the Failure Feed within one Sidekiq processing cycle of the failure event being published.
+- AC-12.3: New failure events appear in the Failure Feed within one Solid Queue processing cycle of the failure event being published.
 - AC-12.4: The Recovery Queue shows the AI diagnosis summary and proposed action for each in-progress recovery.
 - AC-12.5: The Approval Queue renders approve/reject form buttons that submit to `PATCH /approval_queue/:id`.
 - AC-12.6: System Metrics display: total active orders, orders in SLA warning, orders in SLA breached, recovery success count, recovery failure count.

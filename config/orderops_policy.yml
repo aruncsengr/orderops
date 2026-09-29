@@ -1,0 +1,103 @@
+# OrderOps Policy Configuration (ADR-06, REQ-07)
+# All refund/compensation/escalation rules live here — none in code.
+# version is written to every audit record produced during policy evaluation.
+
+version: "1.0.0"
+
+# Guardrail limits (REQ-09)
+reroute_limit: 3                        # max reroute attempts per order
+reroute_approval_threshold: 2           # reroute attempts >= this requires human approval
+full_refund_approval_threshold: "50.00" # BigDecimal — FULL_REFUND above this always needs approval
+min_confidence_threshold: "0.5"         # AI confidence below this requires human approval
+approval_timeout_seconds: 120           # seconds before an unanswered approval escalates
+
+# Refund eligibility by failure type
+# eligible_states: order must be in one of these states
+# max_elapsed_minutes: order must be <= this many minutes old
+refund_eligibility:
+  RESTAURANT_REJECTION:
+    eligible_states: [assigned, failed]
+    max_elapsed_minutes: 120
+  RESTAURANT_UNAVAILABLE:
+    eligible_states: [assigned, accepted, preparing, failed]
+    max_elapsed_minutes: 120
+  INVENTORY_FAILURE:
+    eligible_states: [accepted, preparing, failed]
+    max_elapsed_minutes: 120
+  KITCHEN_DELAY:
+    eligible_states: [preparing, failed]
+    max_elapsed_minutes: 180
+  KITCHEN_FAILURE:
+    eligible_states: [preparing, failed]
+    max_elapsed_minutes: 120
+  DELIVERY_DELAY:
+    eligible_states: [in_delivery, failed]
+    max_elapsed_minutes: 240
+  DELIVERY_FAILURE:
+    eligible_states: [in_delivery, failed]
+    max_elapsed_minutes: 240
+  PAYMENT_FAILURE:
+    eligible_states: [pending, assigned, failed]
+    max_elapsed_minutes: 60
+  EXTERNAL_SERVICE_FAILURE:
+    eligible_states: [pending, assigned, accepted, preparing, failed]
+    max_elapsed_minutes: 120
+
+# Compensation amounts by failure type
+# type: percentage | fixed
+# value: number (percentage: 0-100, fixed: currency amount)
+compensation:
+  RESTAURANT_REJECTION:
+    type: percentage
+    value: 10
+  RESTAURANT_UNAVAILABLE:
+    type: percentage
+    value: 15
+  INVENTORY_FAILURE:
+    type: percentage
+    value: 20
+  KITCHEN_DELAY:
+    type: fixed
+    value: "3.00"
+  KITCHEN_FAILURE:
+    type: percentage
+    value: 25
+  DELIVERY_DELAY:
+    type: fixed
+    value: "5.00"
+  DELIVERY_FAILURE:
+    type: percentage
+    value: 30
+  PAYMENT_FAILURE:
+    type: percentage
+    value: 5
+  EXTERNAL_SERVICE_FAILURE:
+    type: percentage
+    value: 10
+
+# Voucher rules: when a voucher may be issued instead of / in addition to refund
+voucher_rules:
+  min_order_total: "15.00"       # orders below this get cash refund only
+  max_voucher_value: "25.00"
+  expiry_days: 30
+
+# Actions that always require human approval regardless of other conditions
+approval_required:
+  - CANCEL_ORDER
+  - ESCALATE_TO_HUMAN
+
+# Cooldown: minimum minutes between compensations for the same customer
+cooldown_minutes: 1440  # 24 hours
+
+# Deterministic fallback recovery action per failure type (ADR-08)
+# Used when the LLM is unavailable or returns invalid output.
+fallback_recovery:
+  RESTAURANT_REJECTION:    REROUTE_RESTAURANT
+  RESTAURANT_UNAVAILABLE:  REROUTE_RESTAURANT
+  INVENTORY_FAILURE:       REROUTE_RESTAURANT
+  KITCHEN_DELAY:           ESCALATE_TO_HUMAN
+  KITCHEN_FAILURE:         REROUTE_RESTAURANT
+  DELIVERY_DELAY:          ESCALATE_TO_HUMAN
+  DELIVERY_FAILURE:        RETRY_DELIVERY
+  PAYMENT_FAILURE:         ESCALATE_TO_HUMAN
+  EXTERNAL_SERVICE_FAILURE: ESCALATE_TO_HUMAN

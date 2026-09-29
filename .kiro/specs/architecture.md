@@ -50,30 +50,23 @@ All external integrations (restaurant, inventory, payment, delivery) are in-proc
 ### ADR-03 — Event-Driven Internal Architecture with Abstract Event Interface
 
 **Status:** Accepted  
-**Resolves:** OQ-03, Additional Requirement 9  
-**Updated:** Rails 8.1 — Solid Queue replaces Redis-backed ActiveJob as the V1 backing
+**Resolves:** OQ-03, Additional Requirement 9
 
 **Context:**
-The order lifecycle involves multiple subsystems. Direct method calls between them create tight coupling. However, introducing an external broker (Kafka, RabbitMQ) adds operational complexity that is not warranted for V1.
+The order lifecycle involves multiple subsystems. Direct method calls between them create tight coupling. Introducing an external broker (Kafka, RabbitMQ) adds operational complexity not warranted for V1.
 
 **Decision:**
-All subsystems communicate through a typed internal event bus abstraction. In V1, the concrete implementation dispatches events via **Solid Queue** — the Rails 8.1 default database-backed ActiveJob adapter, which uses PostgreSQL with `FOR UPDATE SKIP LOCKED` and requires no Redis. The event bus interface is defined as a Ruby module so a real broker (Kafka, Redis Streams) can be substituted later by swapping the adapter, not the callers.
+All subsystems communicate through a typed internal event bus abstraction. In V1, the concrete implementation dispatches events via **Solid Queue** — the Rails 8 default database-backed ActiveJob adapter, which uses PostgreSQL with `FOR UPDATE SKIP LOCKED` and requires no Redis. The event bus interface is defined as a Ruby module so a real broker (Kafka, Redis Streams) can be substituted later by swapping the adapter, not the callers.
 
 Domain events carry a per-order sequence number. Consumers implement deduplication using event IDs stored in the database. The database (PostgreSQL) is the source of truth; the event bus is a delivery mechanism, not the record of truth.
 
 **Interface contract:**
 ```
-EventBus.publish(event)          # publishes a domain event
+EventBus.publish(event)           # publishes a domain event
 EventBus.subscribe(type, handler) # registers a handler
 ```
 
 The adapter behind `EventBus` is injected at startup (`ActiveJobEventBusAdapter` in V1). A `SynchronousEventBusAdapter` is available for tests to avoid background job overhead.
-
-**Why Solid Queue over Sidekiq for V1:**
-- Solid Queue is the Rails 8 default; zero additional infrastructure (no Redis instance).
-- The Rails 8.1 built-in Sidekiq Active Job adapter is deprecated and will be removed in Rails 8.2; using Sidekiq would require the `sidekiq` gem ≥ 7.3.3 to supply its own adapter.
-- For the OrderOps demo workload (tens to low hundreds of jobs/second), Solid Queue performance is equivalent to Sidekiq.
-- Sidekiq remains a valid future upgrade path; because the event bus is abstracted, switching the backing job queue requires no changes in callers.
 
 **Consequences:**
 - Any new subsystem can subscribe to events without touching existing code.
@@ -81,6 +74,7 @@ The adapter behind `EventBus` is injected at startup (`ActiveJobEventBusAdapter`
 - Event storms are prevented by checking current order state before acting (consumer-side guard).
 - Per-order sequence numbers allow consumers to detect gaps and out-of-order delivery.
 - No Redis process is required to run OrderOps — PostgreSQL is the only database service.
+- **No external message broker in V1.** Events are delivered via ActiveJob backed by Solid Queue (PostgreSQL). The event bus interface abstracts this so a real broker can be substituted later by swapping the adapter.
 
 ---
 
@@ -104,39 +98,34 @@ All state transitions go through the `OrderStateMachine` service. No code sets `
 
 ---
 
-### ADR-05 — Technology Stack: Ruby on Rails 8.1 + PostgreSQL + Solid Queue + Solid Cable + Hotwire
+### ADR-05 — Technology Stack: Ruby 3.4.5 + Rails 8.1.4 + PostgreSQL + Solid Queue + Solid Cable + Hotwire
 
 **Status:** Accepted  
-**Resolves:** OQ-02, OQ-06, OQ-07  
-**Updated:** Targets Rails 8.1.4 (current stable, October 2025). Replaced Redis/Sidekiq with Solid Queue + Solid Cable.
+**Resolves:** OQ-02, OQ-06, OQ-07
 
 **Stack:**
-| Layer | Technology | Rails 8.1 notes |
+| Layer | Technology | Notes |
 |---|---|---|
+| Runtime | Ruby 3.4.5 | Pinned in `.ruby-version` |
 | Application framework | Ruby on Rails 8.1.4 | |
 | Primary database | PostgreSQL | |
-| Background jobs | ActiveJob + **Solid Queue** | Rails 8.1 default; database-backed; no Redis required |
-| Action Cable / WebSockets | **Solid Cable** | Rails 8.1 default; database-backed; no Redis required |
+| Background jobs | ActiveJob + **Solid Queue** | Rails 8 default; database-backed; no Redis required |
+| Action Cable / WebSockets | **Solid Cable** | Rails 8 default; database-backed; no Redis required |
 | Dashboard UI | Rails views + Hotwire (Turbo Streams + Stimulus) | |
-| Asset pipeline | **Propshaft** | Rails 8.1 default; replaces Sprockets |
+| Asset pipeline | **Propshaft** | Rails 8 default; replaces Sprockets |
 | Audit trail persistence | PostgreSQL (`audit_records` table) | |
 | Policy configuration | YAML files loaded via Rails initializer | |
 | Test framework | RSpec + FactoryBot + SimpleCov | |
-| Job continuations | ActiveJob::Continuable | Rails 8.1 new feature; used by `RecoveryOrchestratorJob` |
+| Job continuations | ActiveJob::Continuable | Rails 8.1 feature; used by `RecoveryOrchestratorJob` |
 
 **Rationale:**
-- Rails 8.1 ships Solid Queue and Solid Cable as production defaults, eliminating Redis as a required infrastructure dependency. OrderOps runs with a single PostgreSQL service.
-- Solid Queue uses PostgreSQL's `FOR UPDATE SKIP LOCKED` for efficient job polling — the same database already required for order state.
+- Ruby 3.4.5 is the installed runtime. Pinned in `.ruby-version` for reproducibility.
+- Rails 8.1.4 is the current stable release. Solid Queue and Solid Cable ship as production defaults.
+- Solid Queue uses PostgreSQL's `FOR UPDATE SKIP LOCKED` — the same database already required for order state. No additional infrastructure.
 - Solid Cable stores WebSocket messages in the database; message retention (default: 1 day) is sufficient for the dashboard's real-time update pattern.
-- Propshaft is simpler and faster than Sprockets for applications that do not need asset transpilation; OrderOps uses importmap for JavaScript (no Node.js build step).
-- **Active Job Continuations** (Rails 8.1) allow `RecoveryOrchestratorJob` to checkpoint progress across steps (AI call → policy evaluation → execution), surviving Kamal rolling deploys or pod restarts without re-running completed steps.
-- No Kafka or external event broker is introduced in V1 (see ADR-03).
-
-**No Redis in V1.** PostgreSQL is the only required database service. Redis remains a valid future upgrade for Solid Cable or Solid Queue if throughput demands grow.
-
-**Sidekiq note:** The Rails 8.1 built-in Sidekiq Active Job adapter is deprecated and removed in Rails 8.2. Using Sidekiq now requires the `sidekiq` gem ≥ 7.3.3, which ships its own adapter. This is an additional dependency with no benefit for the OrderOps workload; Solid Queue is the correct Rails-idiomatic choice.
-
-**No external message broker in V1.** Events are delivered via ActiveJob backed by Solid Queue (PostgreSQL). The event bus interface abstracts this so a real broker can be substituted later by swapping the adapter.
+- Propshaft replaces Sprockets; importmap manages JavaScript with no Node.js build step.
+- Active Job Continuations allow `RecoveryOrchestratorJob` to checkpoint across steps (AI call → policy evaluation → execution), surviving restarts without re-running completed steps.
+- No Kafka, no Redis, no Sidekiq in V1. PostgreSQL is the only required database service.
 
 ---
 
@@ -399,7 +388,7 @@ All 10 original open questions are now resolved:
 | OQ | Question | Resolution |
 |---|---|---|
 | OQ-01 | Concurrency model | ADR-04: Optimistic concurrency via Rails `lock_version` |
-| OQ-02 | Technology stack | ADR-05: Rails 8.1.4 + PostgreSQL + Solid Queue + Solid Cable + Hotwire |
+| OQ-02 | Technology stack | ADR-05: Ruby 3.4.5 + Rails 8.1.4 + PostgreSQL + Solid Queue + Solid Cable + Hotwire |
 | OQ-03 | Event bus ordering | ADR-03: Per-order sequence numbers + consumer-side dedup |
 | OQ-04 | AI agent architecture | ADR-08: Single LLM call per recovery event in V1 |
 | OQ-05 | LLM provider | ADR-09: OpenAI-compatible default; fake provider for tests; abstract interface for future providers |

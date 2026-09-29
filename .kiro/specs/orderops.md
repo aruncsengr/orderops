@@ -378,9 +378,9 @@ All 10 original open questions are resolved. See [architecture.md](architecture.
 |---|---|---|
 | ADR-01 | AI is advisory only; policy engine is the decision authority | Accepted |
 | ADR-02 | Simulated integrations for V1; interface-backed for future swap | Accepted |
-| ADR-03 | Event-driven via abstract EventBus; V1 uses ActiveJob/Redis adapter | Accepted |
+| ADR-03 | Event-driven via abstract EventBus; V1 uses ActiveJobEventBusAdapter backed by Solid Queue | Accepted |
 | ADR-04 | OrderStateMachine is authoritative; optimistic concurrency via lock_version | Accepted |
-| ADR-05 | Stack: Rails + PostgreSQL + Redis/Sidekiq + Hotwire | Accepted |
+| ADR-05 | Stack: Ruby 3.4.5 + Rails 8.1.4 + PostgreSQL + Solid Queue + Hotwire | Accepted |
 | ADR-06 | Policy externalised to YAML; pure function evaluation; version in audit trail | Accepted |
 | ADR-07 | FailureInjector is first-class; gated to development/demo environments | Accepted |
 | ADR-08 | Single LLM call per recovery event; deterministic fallback on AI failure | Accepted |
@@ -397,7 +397,7 @@ All 10 original open questions are resolved. See [architecture.md](architecture.
 ## 10. Implementation Phases
 
 ### Phase 1 — Rails Scaffold and Core Plumbing
-1. `rails new orderops --database=postgresql`; configure Redis, Sidekiq, Action Cable
+1. `rails new orderops --database=postgresql`; Solid Queue, Solid Cable, Propshaft configured by default
 2. Database migrations: `orders`, `audit_records`, `recovery_actions`, `approval_queue`, `customers`, `restaurants`
 3. `OrderStateMachine` service with all states, transitions, and `StaleObjectError` handling
 4. `EventBus` abstraction with `ActiveJobEventBusAdapter` and `SynchronousEventBusAdapter` (for tests)
@@ -410,7 +410,7 @@ All 10 original open questions are resolved. See [architecture.md](architecture.
 9. `FailureInjector` with environment guard
 
 ### Phase 3 — Monitoring and Routing
-10. `SlaMonitor` with configurable thresholds; `SlaMonitorJob` on Sidekiq schedule
+10. `SlaMonitor` with configurable thresholds; `SlaMonitorJob` as a Solid Queue recurring job (configured in `config/recurring.yml`)
 11. `RestaurantRouter` with routing criteria and rejection exclusion
 
 ### Phase 4 — Policy Engine

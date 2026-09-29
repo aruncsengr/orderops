@@ -1,0 +1,71 @@
+default: &default
+  llm:
+    provider: fake          # fake | openai — use fake for tests/demo, openai for production
+    model: gpt-4o-mini
+    timeout_seconds: 15
+
+  approvals:
+    mode: manual            # manual | auto_approve (auto_approve only permitted in test/demo)
+    auto_approve_delay_seconds: 2
+
+  simulation:
+    sla_tick_interval_seconds: 10
+    restaurant_response_latency_ms: 500
+    delivery_latency_seconds: 30
+
+  # SLA thresholds per phase (REQ-03) — all in seconds
+  sla_thresholds:
+    assignment_warning_seconds: 60
+    assignment_breach_seconds: 120
+    acceptance_warning_seconds: 90
+    acceptance_breach_seconds: 180
+    preparation_warning_seconds: 600
+    preparation_breach_seconds: 900
+    pickup_warning_seconds: 120
+    pickup_breach_seconds: 240
+    delivery_warning_seconds: 1800
+    delivery_breach_seconds: 2700
+    end_to_end_warning_seconds: 2700
+    end_to_end_breach_seconds: 3600
+
+development:
+  <<: *default
+  llm:
+    provider: fake
+    model: fake-model
+    timeout_seconds: 5
+  simulation:
+    sla_tick_interval_seconds: 5
+
+test:
+  <<: *default
+  llm:
+    provider: fake
+    model: fake-model
+    timeout_seconds: 2
+  approvals:
+    mode: auto_approve
+    auto_approve_delay_seconds: 0
+  simulation:
+    sla_tick_interval_seconds: 1
+
+demo:
+  <<: *default
+  llm:
+    provider: fake
+    model: fake-model
+    timeout_seconds: 5
+  approvals:
+    mode: auto_approve
+    auto_approve_delay_seconds: 1
+  simulation:
+    sla_tick_interval_seconds: 3
+
+production:
+  <<: *default
+  llm:
+    provider: openai
+    model: gpt-4o-mini
+    timeout_seconds: 15
+  approvals:
+    mode: manual
