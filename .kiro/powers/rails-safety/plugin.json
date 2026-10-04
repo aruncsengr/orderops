@@ -1,0 +1,33 @@
+{
+  "name": "rails-safety",
+  "version": "1.0.0",
+  "description": "Local power manifest for Rails safety constraints: state machine row locking, AuditEvent immutability, and ActionExecutor policy verification.",
+  "rules": [
+    {
+      "id": "row-lock-before-transition",
+      "description": "All AASM state machine transitions on order records must be preceded by order.lock! to acquire a PostgreSQL row lock.",
+      "severity": "error",
+      "pattern": "aasm_state transition without lock!"
+    },
+    {
+      "id": "audit-event-immutability",
+      "description": "AuditEvent records are append-only. The model must define before_update and before_destroy callbacks that raise unconditionally.",
+      "severity": "error"
+    },
+    {
+      "id": "policy-bypass-guard",
+      "description": "ActionExecutor must query AuditEvent for an authorization record matching (order_id, recovery_action_id, policy_config_version) and raise PolicyBypassError if none is found.",
+      "severity": "error"
+    },
+    {
+      "id": "recovery-context-frozen",
+      "description": "RecoveryContext must be a deeply frozen Ruby Data object (Data.define on Ruby >= 3.2). No ActiveRecord references or method_missing delegation permitted.",
+      "severity": "error"
+    },
+    {
+      "id": "policy-engine-pure",
+      "description": "PolicyEngine must be a pure function: no I/O, no DB access, no side effects. Given the same inputs it must always return the same output.",
+      "severity": "error"
+    }
+  ]
+}

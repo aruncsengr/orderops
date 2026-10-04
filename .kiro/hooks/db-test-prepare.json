@@ -1,0 +1,15 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "Prepare Test Database",
+      "trigger": "PreTaskExec",
+      "description": "Runs rails db:test:prepare before any spec task begins, ensuring the test database schema is current.",
+      "action": {
+        "type": "command",
+        "command": "bash -c 'echo \"Preparing test database...\" && RAILS_ENV=test bundle exec rails db:test:prepare 2>&1 && echo \"Test database ready.\"'",
+        "timeout": 60
+      }
+    }
+  ]
+}

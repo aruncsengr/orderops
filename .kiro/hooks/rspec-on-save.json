@@ -1,0 +1,16 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "RSpec on File Save",
+      "trigger": "PostFileSave",
+      "description": "Runs the corresponding RSpec spec when a .rb file is saved. If the saved file is a spec, runs it directly. Otherwise resolves the matching spec under spec/.",
+      "matcher": "\\.(rb)$",
+      "action": {
+        "type": "command",
+        "command": "bash -c 'FILE=\"$1\"; if echo \"$FILE\" | grep -q \"_spec\\\\.rb$\"; then bundle exec rspec \"$FILE\" --format progress 2>&1 | tail -20; elif echo \"$FILE\" | grep -q \"^app/\"; then SPEC=$(echo \"$FILE\" | sed \"s|^app/|spec/|; s|\\\\.rb$|_spec.rb|\"); [ -f \"$SPEC\" ] && bundle exec rspec \"$SPEC\" --format progress 2>&1 | tail -20 || echo \"No spec found for $FILE\"; fi' -- \"${file}\"",
+        "timeout": 60
+      }
+    }
+  ]
+}
